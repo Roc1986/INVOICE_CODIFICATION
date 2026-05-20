@@ -126,7 +126,7 @@ def get_gl(product_code: str) -> str | None:
     return None
 
 
-def extract_invoice_data(pdf_bytes: bytes) -> dict:
+def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
     """
     Extrae del PDF (página 1):
       - invoice_no   : número de factura (ej. "82196527")
@@ -432,7 +432,7 @@ with tab_proc:
 
         for idx, f in enumerate(uploaded):
             raw = f.read()
-            data = extract_invoice_data(raw)
+            data = extract_invoice_data(raw, f.name)
             data["filename"] = f.name
             data["raw_bytes"] = raw
 
