@@ -259,7 +259,7 @@ def create_stamp(user: str, vendor: str, cc: str, gl: str,
             # /Rotate=90 (CCW): x_pdf = pw - y_disp, y_pdf = x_disp
             cx_pdf = page_w - disp_cy
             cy_pdf = disp_cx
-            rot_angle = -90   # girar el texto 90° CW para que quede horizontal en pantalla
+            rot_angle = 90    # CCW para compensar el /Rotate=90 CW de la página
         else:  # 270
             # /Rotate=270 (CW): x_pdf = y_disp, y_pdf = pw - x_disp
             cx_pdf = disp_cy
