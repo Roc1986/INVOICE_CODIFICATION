@@ -224,41 +224,85 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
 
 
 def create_stamp(user: str, vendor: str, cc: str, gl: str,
-                 coding_date, page_w: float, page_h: float) -> bytes:
-    """Genera una página PDF transparente con el sello rojo."""
-    sx = st.session_state.stamp_x
-    sy_top = st.session_state.stamp_y_top
+                 coding_date, page_w: float, page_h: float,
+                 rotation: int = 0) -> bytes:
+    """
+    Genera el sello rojo centrado en la parte superior de la página,
+    teniendo en cuenta la rotación del PDF (/Rotate).
+    """
     sw = st.session_state.stamp_w
     sh = st.session_state.stamp_h
-    sy_bottom = sy_top - sh          # esquina inferior del rectángulo
-
-    packet = BytesIO()
-    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
-
-    # Rectángulo rojo con fondo blanco
-    c.setStrokeColorRGB(0.85, 0.0, 0.0)
-    c.setFillColorRGB(1.0, 1.0, 1.0)
-    c.setLineWidth(1.8)
-    c.rect(sx, sy_bottom, sw, sh, fill=1)
-
-    # Texto en rojo
-    c.setFillColorRGB(0.85, 0.0, 0.0)
-    c.setFont("Helvetica-Bold", 8.5)
-
-    line_h = sh / 5.2
-    text_x = sx + 8
-    text_y_start = sy_bottom + sh - line_h * 1.0
+    margin = 18  # margen desde el borde superior visible
 
     date_str = (coding_date.strftime("%d/%m/%Y")
                 if hasattr(coding_date, "strftime") else str(coding_date))
-    lines = [
+    stamp_lines = [
         f"POSTED BY: {user}",
         f"VENDOR: {vendor}",
         f"CC: {cc}  |  GL: {gl}",
         f"DATE: {date_str}",
     ]
-    for i, line in enumerate(lines):
-        c.drawString(text_x, text_y_start - i * line_h, line)
+
+    packet = BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+
+    if rotation in (90, 270):
+        # Página rotada: el contenido se muestra landscape (ancho=page_h, alto=page_w)
+        disp_w = page_h   # ancho visible
+        disp_h = page_w   # alto visible
+
+        # Centro del sello en coordenadas de pantalla
+        disp_cx = disp_w / 2                    # centro horizontal
+        disp_cy = disp_h - margin - sh / 2      # cerca del borde superior
+
+        if rotation == 90:
+            # /Rotate=90 (CCW): x_pdf = pw - y_disp, y_pdf = x_disp
+            cx_pdf = page_w - disp_cy
+            cy_pdf = disp_cx
+            rot_angle = -90   # girar el texto 90° CW para que quede horizontal en pantalla
+        else:  # 270
+            # /Rotate=270 (CW): x_pdf = y_disp, y_pdf = pw - x_disp
+            cx_pdf = disp_cy
+            cy_pdf = page_w - disp_cx
+            rot_angle = 90
+
+        c.saveState()
+        c.translate(cx_pdf, cy_pdf)
+        c.rotate(rot_angle)
+
+        # Dibujar sello centrado en el origen local
+        lx = -sw / 2
+        ly = -sh / 2
+        c.setStrokeColorRGB(0.85, 0.0, 0.0)
+        c.setFillColorRGB(1.0, 1.0, 1.0)
+        c.setLineWidth(1.8)
+        c.rect(lx, ly, sw, sh, fill=1)
+        c.setFillColorRGB(0.85, 0.0, 0.0)
+        c.setFont("Helvetica-Bold", 8.5)
+        line_h = sh / 5.2
+        tx = lx + 10
+        ty = ly + sh - line_h
+        for i, line in enumerate(stamp_lines):
+            c.drawString(tx, ty - i * line_h, line)
+        c.restoreState()
+
+    else:
+        # Página normal (sin rotación o 180°): sello centrado arriba
+        sx = st.session_state.stamp_x
+        sy_top = st.session_state.stamp_y_top
+        sy_bot = sy_top - sh
+
+        c.setStrokeColorRGB(0.85, 0.0, 0.0)
+        c.setFillColorRGB(1.0, 1.0, 1.0)
+        c.setLineWidth(1.8)
+        c.rect(sx, sy_bot, sw, sh, fill=1)
+        c.setFillColorRGB(0.85, 0.0, 0.0)
+        c.setFont("Helvetica-Bold", 8.5)
+        line_h = sh / 5.2
+        tx = sx + 10
+        ty = sy_bot + sh - line_h
+        for i, line in enumerate(stamp_lines):
+            c.drawString(tx, ty - i * line_h, line)
 
     c.save()
     packet.seek(0)
@@ -286,20 +330,22 @@ def stamp_pdf(original_bytes: bytes, stamp_bytes: bytes) -> bytes:
 
 def process_one(original_bytes: bytes, user: str, vendor: str,
                 cc: str, gl: str, coding_date) -> bytes:
-    """Combina la extracción del tamaño de página, creación del sello y merge."""
+    """Lee las dimensiones y rotación de la página, crea el sello y lo aplica."""
     reader = PdfReader(BytesIO(original_bytes))
-    pw = float(reader.pages[0].mediabox.width)
-    ph = float(reader.pages[0].mediabox.height)
-    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph)
+    page = reader.pages[0]
+    pw = float(page.mediabox.width)
+    ph = float(page.mediabox.height)
+    rotation = int(page.get("/Rotate", 0) or 0)
+    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph, rotation)
     return stamp_pdf(original_bytes, stamp_bytes)
 
 
 def make_zip(items: list) -> bytes:
-    """Genera un ZIP con todos los PDFs procesados."""
+    """Genera un ZIP con todos los PDFs procesados (mismo nombre que el original)."""
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in items:
-            zf.writestr(f"coded_{item['filename']}", item["pdf_bytes"])
+            zf.writestr(item["filename"], item["pdf_bytes"])  # nombre original sin prefijo
     buf.seek(0)
     return buf.read()
 
@@ -696,7 +742,7 @@ with tab_res:
                 st.download_button(
                     "⬇️ Descargar",
                     data=item["pdf_bytes"],
-                    file_name=f"coded_{item['filename']}",
+                    file_name=item['filename'],
                     mime="application/pdf",
                     key=f"dl_{i}",
                     use_container_width=True,
