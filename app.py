@@ -1,6 +1,7 @@
 """
-Codificador de Facturas — v1.0
+Codificador de Facturas — v1.1
 Automatización de codificación GL/CC para facturas PDF (Atlantic Packaging)
+Soporte para PDFs digitales y PDFs escaneados (OCR)
 """
 
 import streamlit as st
@@ -15,6 +16,14 @@ import json
 import pandas as pd
 from datetime import date, datetime
 import openpyxl
+
+# OCR para PDFs escaneados (importación opcional con fallback)
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -125,6 +134,7 @@ def extract_invoice_data(pdf_bytes: bytes) -> dict:
       - cc_prefix    : prefijo de 2 letras (ej. "ML")
       - product_code : código de producto (ej. "LB2035")
       - is_six       : True si el N° de factura empieza con "6"
+    Soporta PDFs digitales y PDFs escaneados (con OCR automático).
     """
     result = {
         "invoice_no": None,
@@ -133,49 +143,76 @@ def extract_invoice_data(pdf_bytes: bytes) -> dict:
         "product_code": None,
         "is_six": False,
         "raw_lines": [],
+        "ocr_used": False,
         "error": None,
     }
     try:
+        # ── Paso 1: intentar extracción de texto digital ──────────────────
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             if not pdf.pages:
                 result["error"] = "PDF vacío"
                 return result
             text = pdf.pages[0].extract_text() or ""
 
+        # ── Paso 2: si no hay texto, usar OCR ────────────────────────────
+        if len(text.strip()) < 50:
+            if OCR_AVAILABLE:
+                try:
+                    images = convert_from_bytes(pdf_bytes, first_page=1, last_page=1, dpi=200)
+                    text = pytesseract.image_to_string(images[0])
+                    result["ocr_used"] = True
+                except Exception as ocr_err:
+                    result["error"] = f"OCR falló: {ocr_err}"
+                    return result
+            else:
+                result["error"] = "PDF escaneado — OCR no disponible en este entorno"
+                return result
+
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         result["raw_lines"] = lines
+        text_upper = text.upper()
 
-        # ── 1. Número de factura ──────────────────────────────────────────
-        # Aparece como línea sola ANTES de "INVOICE No/No DE FACTURE"
+        # ── 3. Número de factura ──────────────────────────────────────────
+        # Formato A (digital): número en línea ANTES de "INVOICE No/No DE FACTURE"
+        # Formato B (OCR/portrait): número en la MISMA línea → "INVOICE No/No DE FACTURE 87060660"
         for i, line in enumerate(lines):
             if "INVOICE NO" in line.upper() and "FACTURE" in line.upper():
+                # Formato B: número al final de la misma línea
+                m = re.search(r"(\d{7,10})\s*$", line)
+                if m:
+                    result["invoice_no"] = m.group(1)
+                    result["is_six"] = result["invoice_no"].startswith("6")
+                    break
+                # Formato A: número en líneas anteriores
                 for j in range(max(0, i - 5), i):
-                    m = re.fullmatch(r"\d{6,10}", lines[j])
-                    if m:
-                        result["invoice_no"] = m.group()
+                    if re.fullmatch(r"\d{6,10}", lines[j]):
+                        result["invoice_no"] = lines[j]
                         result["is_six"] = result["invoice_no"].startswith("6")
                         break
                 break
 
-        # ── 2. Customer Order No ──────────────────────────────────────────
-        # Línea: "635108 200 MD9527 Apr 08, 2026 778713917 ..."
-        #         CustNo  Zone  CustomerOrder
+        # Fallback: primer número en el nombre del archivo ("61037398_EV_...pdf")
+        if not result["invoice_no"] and filename:
+            m = re.match(r"(\d{6,10})", filename)
+            if m:
+                result["invoice_no"] = m.group(1)
+                result["is_six"] = result["invoice_no"].startswith("6")
+
+        # ── 4. Customer Order No ──────────────────────────────────────────
+        # Línea: "635108 100 ML11694 ..."  o  "635108 100 | ML11694 ..." (OCR)
         for line in lines:
-            m = re.search(r"\d{6}\s+\d{2,3}\s+([A-Z]{2}\d{4,7})\b", line)
+            m = re.search(r"\d{6}\s+\d{2,3}\s+\|?\s*([A-Z]{2}\d{4,7})\b", line)
             if m:
                 result["customer_order"] = m.group(1)
                 result["cc_prefix"] = m.group(1)[:2].upper()
                 break
 
-        # ── 3. Código de producto ─────────────────────────────────────────
-        # Busca en el texto cualquier código conocido de la tabla GL
+        # ── 5. Código de producto ─────────────────────────────────────────
         known_codes = sorted(
             [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
-            key=len, reverse=True,  # más largo primero → evita falsos positivos
+            key=len, reverse=True,
         )
-        text_upper = text.upper()
         for code in known_codes:
-            # Verificar como palabra completa (no parte de otro token)
             if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
                 result["product_code"] = code
                 break
@@ -459,6 +496,8 @@ with tab_proc:
                         st.info("⚡ Factura tipo **6** — excepción de vendor")
                     if inv.get("error"):
                         st.error(f"Error: {inv['error']}")
+                    if inv.get("ocr_used"):
+                        st.info("🔍 Texto extraído con OCR (PDF escaneado)")
 
                 # ── Col 2: CC y Vendor
                 with c2:
