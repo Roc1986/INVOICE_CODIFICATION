@@ -460,12 +460,26 @@ tab_proc, tab_res, tab_db, tab_cfg = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_proc:
     st.subheader("Subir Facturas PDF")
-    uploaded = st.file_uploader(
-        "Arrastra o selecciona uno o más PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Soporta carga masiva. Se procesa solo la primera página de cada factura.",
-    )
+
+    # Clave dinámica para poder limpiar el uploader
+    if "upload_key" not in st.session_state:
+        st.session_state.upload_key = 0
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        uploaded = st.file_uploader(
+            "Arrastra o selecciona uno o más PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Soporta carga masiva. Se procesa solo la primera página de cada factura.",
+            key=f"uploader_{st.session_state.upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)  # alinea verticalmente
+        if st.button("🗑️ Limpiar\ncarga", use_container_width=True,
+                     help="Elimina todos los archivos cargados para subir un nuevo lote"):
+            st.session_state.upload_key += 1
+            st.rerun()
 
     if not uploaded:
         st.info("📂 Sube facturas para comenzar. Puedes seleccionar múltiples archivos a la vez.")
