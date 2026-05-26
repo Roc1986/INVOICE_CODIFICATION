@@ -404,8 +404,9 @@ def run_matching(invoice_files: list, po_files: list) -> dict:
         if po_id is None:
             pending.append({
                 "invoice_name": fname,
-                "po_id": "—",
-                "reason": "Invalid filename format (needs at least 3 space-separated parts)",
+                "po_id":        "—",
+                "reason":       "Invalid filename format (needs at least 3 space-separated parts)",
+                "inv_bytes":    inv_bytes,
             })
             continue
 
@@ -430,6 +431,7 @@ def run_matching(invoice_files: list, po_files: list) -> dict:
                 "invoice_name": fname,
                 "po_id":        po_id,
                 "reason":       f"No PO file found for '{po_id}'",
+                "inv_bytes":    inv_bytes,
             })
 
     unmatched_po = [
@@ -445,18 +447,17 @@ def run_matching(invoice_files: list, po_files: list) -> dict:
 
 
 def make_matcher_zip(results: dict) -> bytes:
-    """Package matched and pending files into one ZIP."""
+    """
+    Package results into one ZIP with two folders:
+      matched/  — merged Invoice+PO PDFs, ready to replace originals
+      pending/  — original invoice PDFs with no PO match, ready to replace originals
+    """
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in results["matched"]:
             zf.writestr(f"matched/{item['invoice_name']}", item["merged_bytes"])
         for item in results["pending"]:
-            # pending entries don't carry bytes (they were never merged);
-            # write a placeholder .txt so the folder appears in the ZIP
-            zf.writestr(
-                f"pending/{item['invoice_name']}.txt",
-                f"No match found.\nPO searched: {item['po_id']}\nReason: {item['reason']}\n",
-            )
+            zf.writestr(f"pending/{item['invoice_name']}", item["inv_bytes"])
     buf.seek(0)
     return buf.read()
 
