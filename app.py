@@ -103,7 +103,8 @@ def init_state():
         "stamp_w":           230,
         "stamp_h":           82,
         # Matcher state
-        "matcher_results":   None,   # dict with matched/pending/unmatched_po
+        "matcher_results":    None,   # dict with matched/pending/unmatched_po
+        "matcher_zip":        None,   # pre-built ZIP bytes — avoids re-building on every render
         "matcher_upload_key": 0,
     }
     for k, v in defaults.items():
@@ -337,7 +338,7 @@ def flatten_pdf(pdf_bytes: bytes) -> bytes:
     if OCR_AVAILABLE:
         try:
             from pdf2image import convert_from_bytes
-            pages = convert_from_bytes(pdf_bytes, dpi=150)
+            pages = convert_from_bytes(pdf_bytes, dpi=120)   # 120 dpi: fast + readable
             out = BytesIO()
             if len(pages) == 1:
                 pages[0].save(out, format="PDF")
@@ -378,15 +379,16 @@ def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
         return out.read()
 
 
-def run_matching(invoice_files: list, po_files: list) -> dict:
+def run_matching(invoice_files: list, po_files: list,
+                 progress_callback=None) -> dict:
     """
     Core matching logic.
+    progress_callback(current, total, filename) called per invoice.
     Returns:
-        matched   : [{invoice_name, po_name, po_id, merged_bytes}]
-        pending   : [{invoice_name, po_id, reason}]            (invoices with no PO match)
-        unmatched_po: [po_name]                                (POs not used)
+        matched      : [{invoice_name, po_name, po_id, merged_bytes}]
+        pending      : [{invoice_name, po_id, reason, inv_bytes}]
+        unmatched_po : [po_name]
     """
-    # Build PO lookup: PO_ID (uppercase, no extension) → bytes
     po_lookup = {}
     for f in po_files:
         key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
@@ -395,10 +397,15 @@ def run_matching(invoice_files: list, po_files: list) -> dict:
     used_po_keys = set()
     matched = []
     pending = []
+    total = len(invoice_files)
 
-    for inv_file in invoice_files:
+    for i, inv_file in enumerate(invoice_files):
         inv_bytes = inv_file.read()
         fname = inv_file.name
+
+        if progress_callback:
+            progress_callback(i, total, fname)
+
         po_id = extract_po_from_invoice_name(fname)
 
         if po_id is None:
@@ -928,6 +935,7 @@ with tab_match:
         if st.button("🔄 Reset / New Batch", use_container_width=True):
             st.session_state.matcher_upload_key += 1
             st.session_state.matcher_results = None
+            st.session_state.matcher_zip = None
             st.rerun()
 
     # ── Run matching ──────────────────────────────────────────────────────────
@@ -943,9 +951,19 @@ with tab_match:
             st.caption("Upload both invoices and POs to enable matching.")
 
     if run_btn and can_run:
-        with st.spinner(f"Processing {len(inv_files)} invoices against {len(po_files)} POs…"):
-            results = run_matching(inv_files, po_files)
-            st.session_state.matcher_results = results
+        prog_bar  = st.progress(0, text="Starting…")
+        prog_text = st.empty()
+        def _progress(current, total, fname):
+            pct = int(current / total * 100)
+            prog_bar.progress(pct, text=f"Processing {current+1}/{total}: {fname}")
+            prog_text.caption(f"⏳ Flattening & matching — {current+1} of {total}")
+        results = run_matching(inv_files, po_files, progress_callback=_progress)
+        prog_bar.progress(100, text="✅ Done — building ZIP…")
+        prog_text.empty()
+        st.session_state.matcher_results = results
+        st.session_state.matcher_zip = make_matcher_zip(results)
+        prog_bar.empty()
+        st.rerun()
 
     # ── Display results ───────────────────────────────────────────────────────
     results = st.session_state.matcher_results
@@ -989,8 +1007,9 @@ with tab_match:
         st.markdown("<br>", unsafe_allow_html=True)
 
         # ── Download ZIP ──────────────────────────────────────────────────────
-        if matched:
-            zip_data = make_matcher_zip(results)
+        # Use pre-built ZIP from session_state — avoids re-building on every Streamlit render
+        zip_data = st.session_state.get("matcher_zip")
+        if zip_data:
             st.download_button(
                 f"⬇️ Download Results ZIP  ({len(matched)} matched · {len(pending)} pending)",
                 data=zip_data,
@@ -1001,7 +1020,7 @@ with tab_match:
             )
             st.caption(
                 "ZIP contains: **matched/** — merged Invoice+PO PDFs · "
-                "**pending/** — invoices with no matching PO (info text files)"
+                "**pending/** — original invoice PDFs with no PO match"
             )
 
         st.divider()
