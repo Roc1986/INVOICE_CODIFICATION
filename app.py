@@ -188,10 +188,13 @@ def _splitter_extract_bol(lines: list) -> str | None:
     Always use the LAST (second) BOL value when two exist.
     For multi-item invoices, use the BOL from the FIRST item only.
     """
-    # Priority: numeric second-line BOL — 5 to 9 digits followed by decimal+MSF
-    # Covers 6-digit (e.g. 354192) and 8-digit (e.g. 24286651) BOL numbers
+    # Priority: second-line BOL — identifier followed by decimal+MSF
+    # The identifier can be:
+    #   • Pure digits   : 354192, 24286651  (layouts A & B)
+    #   • Letter+digits : C249328           (layout C — letter-prefixed BOL)
+    # [A-Z]? makes the leading letter optional, covering all three layouts.
     for line in lines:
-        m = re.match(r"^(\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
+        m = re.match(r"^([A-Z]?\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
         if m:
             return m.group(1)
 
