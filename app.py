@@ -176,19 +176,22 @@ def _splitter_extract_order_no(lines: list) -> str | None:
 def _splitter_extract_bol(lines: list) -> str | None:
     """
     Bill of Lading rules:
-    • Two-line BOL:
-        Line 1: F0002775  1  CAWT25  25# WhiteTop ...   (alphanumeric BOL)
-        Line 2: 354192  195.331  MSF  4824  LB  ML11465  (numeric BOL ← USE THIS)
-      Pattern for line 2: starts with 5-7 digits, then decimal, then MSF
+    • Two-line BOL — the second line contains the value to use:
+        Layout A:  F0002775  1  CAWT25  ...  (line 1)
+                   354192  195.331  MSF  4824  LB  ML11465  (line 2 ← USE THIS)
+        Layout B:  F0002776  3  PRCM30  ...  (line 1)
+                   24286651  606.06  MSF  18120  LB  ML11673  (line 2 ← USE THIS)
+      Both layouts: line 2 starts with digits (5–9), then decimal/integer, then MSF.
+      The only difference was digit length (6 vs 8) — now covered by \d{5,9}.
     • Single-line BOL:
-        N0089112  8  LB2035  35# EnviroLiner ...         (alphanumeric ← USE THIS)
-      Pattern: starts with letter + digits
+        N0089112  8  LB2035  35# EnviroLiner ...  (alphanumeric ← USE THIS)
     Always use the LAST (second) BOL value when two exist.
     For multi-item invoices, use the BOL from the FIRST item only.
     """
-    # Priority: numeric second-line BOL  (e.g. 354192)
+    # Priority: numeric second-line BOL — 5 to 9 digits followed by decimal+MSF
+    # Covers 6-digit (e.g. 354192) and 8-digit (e.g. 24286651) BOL numbers
     for line in lines:
-        m = re.match(r"^(\d{5,7})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
+        m = re.match(r"^(\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
         if m:
             return m.group(1)
 
