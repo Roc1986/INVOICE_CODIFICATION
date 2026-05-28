@@ -195,9 +195,11 @@ def _splitter_extract_bol(lines: list) -> str | None:
         if m:
             return m.group(1)
 
-    # Fallback: alphanumeric single-line BOL (e.g. N0089112)
+    # Fallback: alphanumeric single-line BOL (e.g. C0012857, N0089112)
+    # Product code after qty can be alphabetic (CAWT25) OR numeric (001912) —
+    # only require: letter + 5-9 digits, space, qty digits, space
     for line in lines:
-        m = re.match(r"^([A-Z]\d{5,9})\s+\d+\s+[A-Z]", line.strip())
+        m = re.match(r"^([A-Z]\d{5,9})\s+\d+\s", line.strip())
         if m:
             return m.group(1)
 
