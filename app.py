@@ -1,7 +1,8 @@
 """
-Atlantic Packaging — Invoice Tools  v2.0
-• Invoice Codifier  : GL / Cost-Centre stamp on invoice PDFs
-• Invoice Matcher   : Match invoices with POs, flatten & merge into single PDFs
+Atlantic Packaging — Invoice Tools  v3.0
+• Invoice Splitter   : Split batch PDFs into individual invoice PDFs
+• Invoice Matcher    : Match invoices with POs, flatten & merge into single PDFs
+• Invoice Codifier   : GL / Cost-Centre stamp on invoice PDFs
 """
 
 import streamlit as st
@@ -94,24 +95,197 @@ VENDOR_EXCEPCION = "0101000390"
 # ─────────────────────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
-        "proveedores":       copy.deepcopy(DEFAULT_PROVEEDORES),
-        "gl_codes":          copy.deepcopy(DEFAULT_GL_CODES),
-        "usuarios":          DEFAULT_USERS.copy(),
-        "processed":         [],
-        "stamp_x":           281,
-        "stamp_y_top":       594,
-        "stamp_w":           230,
-        "stamp_h":           82,
+        "proveedores":         copy.deepcopy(DEFAULT_PROVEEDORES),
+        "gl_codes":            copy.deepcopy(DEFAULT_GL_CODES),
+        "usuarios":            DEFAULT_USERS.copy(),
+        "processed":           [],
+        "stamp_x":             281,
+        "stamp_y_top":         594,
+        "stamp_w":             230,
+        "stamp_h":             82,
         # Matcher state
-        "matcher_results":    None,   # dict with matched/pending/unmatched_po
-        "matcher_zip":        None,   # pre-built ZIP bytes — avoids re-building on every render
-        "matcher_upload_key": 0,
+        "matcher_results":     None,
+        "matcher_zip":         None,
+        "matcher_upload_key":  0,
+        # Splitter state
+        "splitter_results":    [],   # [{"filename", "pdf_bytes", "invoice_no", "cc", "bol", "pages", "warning"}]
+        "splitter_zip":        None,
+        "splitter_upload_key": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 init_state()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── SPLITTER FUNCTIONS ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _splitter_get_cc(raw_prefix: str) -> str:
+    """
+    Map the raw 2-char prefix from Customer Order No. to the CC used in filename.
+    Looks up the vendor table: prefijo -> cc field -> take first 2 chars.
+    e.g.  ML -> ML01 -> "ML"
+          MD -> EV01 -> "EV"
+    Falls back to the raw prefix if not found.
+    """
+    if not raw_prefix:
+        return "??"
+    key = raw_prefix.upper().strip()
+    for row in st.session_state.proveedores:
+        if str(row.get("prefijo", "")).upper().strip() == key:
+            cc_val = str(row.get("cc", ""))
+            return cc_val[:2].upper() if len(cc_val) >= 2 else cc_val.upper()
+    return key  # fallback: use raw prefix as-is
+
+
+def _splitter_extract_invoice_no(lines: list) -> str | None:
+    """
+    Invoice number appears on the line JUST BEFORE 'INVOICE No/No DE FACTURE'.
+    Also handles it trailing on the same line.
+    """
+    for i, line in enumerate(lines):
+        if "INVOICE NO" in line.upper() and "FACTURE" in line.upper():
+            # Number at end of same line
+            m = re.search(r"(\d{7,10})\s*$", line)
+            if m:
+                return m.group(1)
+            # Number on any of the 4 preceding lines
+            for j in range(max(0, i - 4), i):
+                m = re.fullmatch(r"\d{6,10}", lines[j].strip())
+                if m:
+                    return lines[j].strip()
+            break
+    return None
+
+
+def _splitter_extract_order_no(lines: list) -> str | None:
+    """
+    Customer Order No. appears in a line like:
+      635108  100  ML11465  Dec 18, 2025  778713917 ...
+    Returns the full order number e.g. 'ML11465'.
+    """
+    for line in lines:
+        m = re.search(r"\d{6}\s+\d{2,3}\s+([A-Z]{2}\d{4,7})\b", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _splitter_extract_bol(lines: list) -> str | None:
+    """
+    Bill of Lading rules:
+    • Two-line BOL:
+        Line 1: F0002775  1  CAWT25  25# WhiteTop ...   (alphanumeric BOL)
+        Line 2: 354192  195.331  MSF  4824  LB  ML11465  (numeric BOL ← USE THIS)
+      Pattern for line 2: starts with 5-7 digits, then decimal, then MSF
+    • Single-line BOL:
+        N0089112  8  LB2035  35# EnviroLiner ...         (alphanumeric ← USE THIS)
+      Pattern: starts with letter + digits
+    Always use the LAST (second) BOL value when two exist.
+    For multi-item invoices, use the BOL from the FIRST item only.
+    """
+    # Priority: numeric second-line BOL  (e.g. 354192)
+    for line in lines:
+        m = re.match(r"^(\d{5,7})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
+        if m:
+            return m.group(1)
+
+    # Fallback: alphanumeric single-line BOL (e.g. N0089112)
+    for line in lines:
+        m = re.match(r"^([A-Z]\d{5,9})\s+\d+\s+[A-Z]", line.strip())
+        if m:
+            return m.group(1)
+
+    return None
+
+
+def split_batch_pdf(pdf_bytes: bytes) -> list:
+    """
+    Split a multi-invoice Atlantic batch PDF into individual invoices.
+    Returns list of dicts:
+      { filename, pdf_bytes, invoice_no, cc, bol, pages (1-based), source_pages, warning }
+    """
+    reader   = PdfReader(BytesIO(pdf_bytes))
+    invoices = []   # accumulated invoice dicts
+    current  = None # {"number", "cc_raw", "bol", "pages": [0-based idx]}
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text  = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+            is_continuation = (
+                "...Continued from previous page" in text
+                or "Continued from previous page" in text
+            )
+
+            if is_continuation and current is not None:
+                current["pages"].append(page_idx)
+                continue
+
+            inv_no = _splitter_extract_invoice_no(lines)
+
+            if inv_no:
+                if current is not None:
+                    invoices.append(current)
+                order_no = _splitter_extract_order_no(lines)
+                cc_raw   = order_no[:2].upper() if order_no else None
+                bol      = _splitter_extract_bol(lines)
+                current  = {
+                    "number":  inv_no,
+                    "cc_raw":  cc_raw,
+                    "bol":     bol,
+                    "pages":   [page_idx],
+                }
+            elif current is not None:
+                # Page without a clear invoice marker — attach to current
+                current["pages"].append(page_idx)
+
+    if current is not None:
+        invoices.append(current)
+
+    # Build output list
+    results = []
+    for inv in invoices:
+        writer = PdfWriter()
+        for p in inv["pages"]:
+            writer.add_page(reader.pages[p])
+        buf = BytesIO()
+        writer.write(buf)
+
+        inv_no = inv["number"]
+        cc     = _splitter_get_cc(inv["cc_raw"]) if inv["cc_raw"] else "??"
+        bol    = inv["bol"] or "??"
+        warn   = None
+        if inv["cc_raw"] is None:
+            warn = "⚠️ Customer Order No. not detected — CC set to '??'"
+        if inv["bol"] is None:
+            warn = (warn or "") + "  ⚠️ Bill of Lading not detected — BOL set to '??'"
+
+        results.append({
+            "filename":     f"{inv_no} {cc} {bol}.pdf",
+            "pdf_bytes":    buf.getvalue(),
+            "invoice_no":   inv_no,
+            "cc":           cc,
+            "bol":          bol,
+            "source_pages": [p + 1 for p in inv["pages"]],
+            "page_count":   len(inv["pages"]),
+            "warning":      warn,
+        })
+
+    return results
+
+
+def make_splitter_zip(results: list) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in results:
+            zf.writestr(item["filename"], item["pdf_bytes"])
+    buf.seek(0)
+    return buf.read()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── CODIFIER FUNCTIONS ────────────────────────────────────────────────────────
@@ -317,12 +491,6 @@ def extract_po_from_invoice_name(filename: str) -> str | None:
 
 
 def flatten_pdf(pdf_bytes: bytes) -> bytes:
-    """
-    Flatten/repair a PDF so it renders consistently.
-    First tries pikepdf (fast structural repair), then falls back to
-    rasterizing via pdf2image (full visual flatten).
-    """
-    # Try pikepdf repair first
     if PIKEPDF_AVAILABLE:
         try:
             inp = BytesIO(pdf_bytes)
@@ -332,13 +500,12 @@ def flatten_pdf(pdf_bytes: bytes) -> bytes:
             out.seek(0)
             return out.read()
         except Exception:
-            pass  # fall through to rasterize
+            pass
 
-    # Fallback: rasterize all pages → rebuild as image PDF
     if OCR_AVAILABLE:
         try:
             from pdf2image import convert_from_bytes
-            pages = convert_from_bytes(pdf_bytes, dpi=120)   # 120 dpi: fast + readable
+            pages = convert_from_bytes(pdf_bytes, dpi=120)
             out = BytesIO()
             if len(pages) == 1:
                 pages[0].save(out, format="PDF")
@@ -350,12 +517,10 @@ def flatten_pdf(pdf_bytes: bytes) -> bytes:
         except Exception:
             pass
 
-    # Last resort: return original bytes unchanged
     return pdf_bytes
 
 
 def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
-    """Merge two PDFs into one, using pikepdf if available, else pypdf."""
     if PIKEPDF_AVAILABLE:
         out = BytesIO()
         with pikepdf.Pdf.new() as merged:
@@ -367,7 +532,6 @@ def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
         out.seek(0)
         return out.read()
     else:
-        # Fallback with pypdf
         writer = PdfWriter()
         for b in (bytes1, bytes2):
             reader = PdfReader(BytesIO(b))
@@ -381,14 +545,6 @@ def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
 
 def run_matching(invoice_files: list, po_files: list,
                  progress_callback=None) -> dict:
-    """
-    Core matching logic.
-    progress_callback(current, total, filename) called per invoice.
-    Returns:
-        matched      : [{invoice_name, po_name, po_id, merged_bytes}]
-        pending      : [{invoice_name, po_id, reason, inv_bytes}]
-        unmatched_po : [po_name]
-    """
     po_lookup = {}
     for f in po_files:
         key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
@@ -421,12 +577,9 @@ def run_matching(invoice_files: list, po_files: list,
         if po_key in po_lookup:
             po_bytes = po_lookup[po_key]
             used_po_keys.add(po_key)
-
-            # Flatten both before merging
             flat_inv = flatten_pdf(inv_bytes)
             flat_po  = flatten_pdf(po_bytes)
             merged   = merge_two_pdfs(flat_inv, flat_po)
-
             matched.append({
                 "invoice_name": fname,
                 "po_name":      f"{po_id}.pdf",
@@ -454,11 +607,6 @@ def run_matching(invoice_files: list, po_files: list,
 
 
 def make_matcher_zip(results: dict) -> bytes:
-    """
-    Package results into one ZIP with two folders:
-      matched/  — merged Invoice+PO PDFs, ready to replace originals
-      pending/  — original invoice PDFs with no PO match, ready to replace originals
-    """
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in results["matched"]:
@@ -509,6 +657,15 @@ st.markdown("""
 .amber { color: #e08000; }
 .red   { color: #dc3545; }
 .blue  { color: #0d6efd; }
+.split-row {
+    background: #f8f9fa; border-radius: 8px; padding: 10px 14px;
+    margin-bottom: 6px; border-left: 4px solid #0d6efd;
+    font-size: 14px;
+}
+.split-warn {
+    border-left-color: #ffc107 !important;
+    background: #fffdf0 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -580,19 +737,322 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <h1 style='margin-bottom:0'>📄 Atlantic — Invoice Tools</h1>
-<p style='color:gray;margin-top:4px'>Invoice Codifier &nbsp;·&nbsp; Invoice &amp; PO Matcher</p>
+<p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_proc, tab_res, tab_match, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_proc, tab_res, tab_db, tab_cfg = st.tabs([
+    "✂️  Invoice Splitter",
+    "🔗  Invoice Matcher",
     "📤  Process Invoices",
     "📋  Results",
-    "🔗  Invoice Matcher",
     "🗄️  Database",
     "⚙️  Settings",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — PROCESS INVOICES
+# TAB 1 — INVOICE SPLITTER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_split:
+    st.subheader("✂️ Split Batch Invoice PDFs")
+    st.markdown(
+        "Upload one or more **batch PDFs** from Atlantic (each may contain multiple invoices). "
+        "The tool will detect each invoice automatically, split them into individual PDFs, "
+        "and name each file as **`{Invoice No} {CC} {Bill of Lading}.pdf`** — "
+        "ready to use directly in the Matcher tab."
+    )
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        split_uploads = st.file_uploader(
+            "Drag or select one or more batch PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"split_uploader_{st.session_state.splitter_upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="split_clear"):
+            st.session_state.splitter_results  = []
+            st.session_state.splitter_zip      = None
+            st.session_state.splitter_upload_key += 1
+            st.rerun()
+
+    if split_uploads:
+        do_split = st.button("✂️ Split Invoices", type="primary", use_container_width=False)
+
+        if do_split:
+            st.session_state.splitter_results = []
+            st.session_state.splitter_zip     = None
+            all_results = []
+            prog = st.progress(0, text="Processing…")
+
+            for f_idx, f in enumerate(split_uploads):
+                prog.progress((f_idx) / len(split_uploads),
+                              text=f"Splitting {f.name}…")
+                try:
+                    batch_results = split_batch_pdf(f.read())
+                    for r in batch_results:
+                        r["source_file"] = f.name
+                    all_results.extend(batch_results)
+                except Exception as e:
+                    st.error(f"Error processing **{f.name}**: {e}")
+
+            prog.progress(1.0, text="✅ Done")
+            st.session_state.splitter_results = all_results
+            if all_results:
+                st.session_state.splitter_zip = make_splitter_zip(all_results)
+            st.rerun()
+
+    # ── Results display ───────────────────────────────────────────────────────
+    results = st.session_state.splitter_results
+
+    if results:
+        n_ok   = sum(1 for r in results if not r["warning"])
+        n_warn = sum(1 for r in results if r["warning"])
+
+        # Summary stats
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num blue'>{len(results)}</div>"
+                f"<div class='stat-lbl'>Invoices detected</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num green'>{n_ok}</div>"
+                f"<div class='stat-lbl'>Ready to download</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num amber'>{n_warn}</div>"
+                f"<div class='stat-lbl'>Need review</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Download all ZIP
+        if st.session_state.splitter_zip:
+            st.download_button(
+                f"⬇️ Download all as ZIP ({len(results)} invoices)",
+                data=st.session_state.splitter_zip,
+                file_name=f"split_invoices_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                type="primary",
+            )
+
+        st.divider()
+
+        # Per-invoice rows
+        for item in results:
+            row_cls = "split-row split-warn" if item["warning"] else "split-row"
+            icon    = "⚠️" if item["warning"] else "✅"
+
+            col_info, col_dl = st.columns([5, 1])
+            with col_info:
+                pages_str = ", ".join(str(p) for p in item["source_pages"])
+                page_lbl  = f"{item['page_count']} page{'s' if item['page_count'] > 1 else ''}"
+                st.markdown(
+                    f"<div class='{row_cls}'>"
+                    f"{icon} <b>{item['filename']}</b>"
+                    f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                    f"Invoice: <code>{item['invoice_no']}</code> &nbsp; "
+                    f"CC: <code>{item['cc']}</code> &nbsp; "
+                    f"BOL: <code>{item['bol']}</code> &nbsp; "
+                    f"· {page_lbl} (source p. {pages_str})"
+                    f"{'<br><span style=\"color:#e08000;font-size:12px\">' + item['warning'] + '</span>' if item['warning'] else ''}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with col_dl:
+                st.download_button(
+                    "⬇️",
+                    data=item["pdf_bytes"],
+                    file_name=item["filename"],
+                    mime="application/pdf",
+                    key=f"spdl_{item['filename']}_{item['invoice_no']}",
+                    use_container_width=True,
+                    help=f"Download {item['filename']}",
+                )
+
+    elif not split_uploads:
+        st.info("📂 Upload one or more Atlantic batch PDFs to get started.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — INVOICE MATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_match:
+    st.subheader("🔗 Invoice & PO Matcher")
+    st.markdown(
+        "Upload your invoice PDFs and your PO (Purchase Order) PDFs. "
+        "The tool will match them by PO number, flatten both documents to ensure "
+        "consistent rendering, merge them into a single PDF, and package everything for download."
+    )
+
+    if not PIKEPDF_AVAILABLE:
+        st.warning(
+            "⚠️ **pikepdf** is not installed. Flattening will use rasterization (pdf2image) as fallback. "
+            "Add `pikepdf` to `requirements.txt` for best results."
+        )
+
+    st.info(
+        "📋 **Expected invoice filename format:** `{Invoice No} {Cost Centre} {PO Number}.pdf`  \n"
+        "Example: `82196530 ML V0020978.pdf`  →  will search for PO file `V0020978.pdf`"
+    )
+
+    col_inv, col_po = st.columns(2)
+    with col_inv:
+        st.markdown("**📄 Invoice PDFs**")
+        inv_files = st.file_uploader(
+            "Upload invoices",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"match_inv_{st.session_state.matcher_upload_key}",
+            label_visibility="collapsed",
+        )
+        if inv_files:
+            st.caption(f"{len(inv_files)} invoice(s) loaded")
+
+    with col_po:
+        st.markdown("**📦 PO PDFs**")
+        po_files = st.file_uploader(
+            "Upload POs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"match_po_{st.session_state.matcher_upload_key}",
+            label_visibility="collapsed",
+        )
+        if po_files:
+            st.caption(f"{len(po_files)} PO(s) loaded")
+
+    col_run, col_clr, _ = st.columns([2, 2, 5])
+    with col_run:
+        run_match = st.button(
+            "🔗 Run Matching",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(inv_files),
+        )
+    with col_clr:
+        if st.button("🗑️ Clear results", use_container_width=True):
+            st.session_state.matcher_results    = None
+            st.session_state.matcher_zip        = None
+            st.session_state.matcher_upload_key += 1
+            st.rerun()
+
+    if run_match and inv_files:
+        if not po_files:
+            st.warning("⚠️ No PO files uploaded — all invoices will be marked as pending.")
+
+        prog_bar  = st.progress(0, text="Matching…")
+        prog_text = st.empty()
+
+        def _progress(cur, tot, fname):
+            prog_bar.progress((cur + 1) / tot, text=f"Processing {fname}…")
+            prog_text.caption(f"({cur + 1}/{tot})")
+
+        results = run_matching(inv_files, po_files or [], progress_callback=_progress)
+        prog_bar.progress(1.0, text="✅ Done")
+        prog_text.empty()
+
+        st.session_state.matcher_results = results
+        st.session_state.matcher_zip     = make_matcher_zip(results)
+        st.rerun()
+
+    # ── Results ────────────────────────────────────────────────────────────────
+    if st.session_state.matcher_results:
+        results     = st.session_state.matcher_results
+        matched     = results["matched"]
+        pending     = results["pending"]
+        unmatched_po = results["unmatched_po"]
+
+        # Stats
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num green'>{len(matched)}</div>"
+                f"<div class='stat-lbl'>Matched</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num amber'>{len(pending)}</div>"
+                f"<div class='stat-lbl'>Unmatched invoices</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num blue'>{len(unmatched_po)}</div>"
+                f"<div class='stat-lbl'>Unused POs</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.session_state.matcher_zip:
+            st.download_button(
+                "⬇️ Download all results (ZIP)",
+                data=st.session_state.matcher_zip,
+                file_name=f"matched_invoices_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                type="primary",
+            )
+
+        st.divider()
+
+        if matched:
+            with st.expander(f"✅ Matched ({len(matched)})", expanded=True):
+                for item in matched:
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        st.markdown(
+                            f"<div class='match-row'>"
+                            f"✅ <b>{item['invoice_name']}</b>"
+                            f"&nbsp;&nbsp;+&nbsp;&nbsp;"
+                            f"📦 <code>{item['po_name']}</code>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with col2:
+                        st.download_button(
+                            "⬇️",
+                            data=item["merged_bytes"],
+                            file_name=item["invoice_name"],
+                            mime="application/pdf",
+                            key=f"mdl_{item['invoice_name']}",
+                            use_container_width=True,
+                        )
+
+        if pending:
+            with st.expander(f"⚠️ Unmatched Invoices ({len(pending)})", expanded=True):
+                st.caption("These invoices had no corresponding PO file.")
+                for item in pending:
+                    st.markdown(
+                        f"<div class='pending-row'>"
+                        f"📄 <b>{item['invoice_name']}</b>"
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                        f"PO searched: <code>{item['po_id']}</code>"
+                        f"&nbsp;&nbsp;—&nbsp;&nbsp;"
+                        f"{item['reason']}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        if unmatched_po:
+            with st.expander(f"📦 Unused POs ({len(unmatched_po)})"):
+                st.caption("These PO files were uploaded but no invoice referenced them.")
+                for po_name in unmatched_po:
+                    st.markdown(f"- `{po_name}.pdf`")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — PROCESS INVOICES (CODIFIER)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_proc:
     st.subheader("Upload Invoice PDFs")
@@ -788,8 +1248,9 @@ with tab_proc:
                 st.success(f"🎉 **{len(invoices_ui)} invoice(s)** coded successfully. Go to **Results** to download them.")
                 st.balloons()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — RESULTS
+# TAB 4 — RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_res:
     if not st.session_state.processed:
@@ -877,204 +1338,9 @@ with tab_res:
                 st.session_state.processed.pop(i)
             st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — INVOICE MATCHER  (NEW)
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_match:
-    st.subheader("🔗 Invoice & PO Matcher")
-    st.markdown(
-        "Upload your invoice PDFs and your PO (Purchase Order) PDFs. "
-        "The tool will match them by PO number, flatten both documents to ensure "
-        "consistent rendering, merge them into a single PDF, and package everything for download."
-    )
-
-    if not PIKEPDF_AVAILABLE:
-        st.warning(
-            "⚠️ **pikepdf** is not installed. Flattening will use rasterization (pdf2image) as fallback. "
-            "Add `pikepdf` to `requirements.txt` for best results."
-        )
-
-    st.info(
-        "📋 **Expected invoice filename format:** `{Invoice No} {Cost Centre} {PO Number}.pdf`  \n"
-        "Example: `82196530 ML V0020978.pdf`  →  will search for PO file `V0020978.pdf`"
-    )
-
-    st.divider()
-
-    # ── File uploaders ────────────────────────────────────────────────────────
-    mk = st.session_state.matcher_upload_key
-    col_inv, col_po = st.columns(2)
-
-    with col_inv:
-        st.markdown("### 📥 Invoices")
-        inv_files = st.file_uploader(
-            "Upload invoice PDFs",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key=f"match_inv_{mk}",
-            help="Files must follow the format: InvoiceNo CostCenter PONumber.pdf",
-        )
-        if inv_files:
-            st.success(f"✅ {len(inv_files)} invoice(s) loaded")
-
-    with col_po:
-        st.markdown("### 📦 Purchase Orders (POs)")
-        po_files = st.file_uploader(
-            "Upload PO PDFs",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key=f"match_po_{mk}",
-            help="Files must be named exactly as the PO number, e.g. V0020978.pdf",
-        )
-        if po_files:
-            st.success(f"✅ {len(po_files)} PO(s) loaded")
-
-    # ── Reset button ──────────────────────────────────────────────────────────
-    col_run, col_reset = st.columns([2, 1])
-    with col_reset:
-        if st.button("🔄 Reset / New Batch", use_container_width=True):
-            st.session_state.matcher_upload_key += 1
-            st.session_state.matcher_results = None
-            st.session_state.matcher_zip = None
-            st.rerun()
-
-    # ── Run matching ──────────────────────────────────────────────────────────
-    with col_run:
-        can_run = bool(inv_files) and bool(po_files)
-        run_btn = st.button(
-            "🚀 Run Matching",
-            type="primary",
-            use_container_width=True,
-            disabled=not can_run,
-        )
-        if not can_run:
-            st.caption("Upload both invoices and POs to enable matching.")
-
-    if run_btn and can_run:
-        prog_bar  = st.progress(0, text="Starting…")
-        prog_text = st.empty()
-        def _progress(current, total, fname):
-            pct = int(current / total * 100)
-            prog_bar.progress(pct, text=f"Processing {current+1}/{total}: {fname}")
-            prog_text.caption(f"⏳ Flattening & matching — {current+1} of {total}")
-        results = run_matching(inv_files, po_files, progress_callback=_progress)
-        prog_bar.progress(100, text="✅ Done — building ZIP…")
-        prog_text.empty()
-        st.session_state.matcher_results = results
-        st.session_state.matcher_zip = make_matcher_zip(results)
-        prog_bar.empty()
-        st.rerun()
-
-    # ── Display results ───────────────────────────────────────────────────────
-    results = st.session_state.matcher_results
-    if results is not None:
-        st.divider()
-        matched      = results["matched"]
-        pending      = results["pending"]
-        unmatched_po = results["unmatched_po"]
-
-        # Summary metrics
-        c1, c2, c3, c4 = st.columns(4)
-        total = len(matched) + len(pending)
-        match_pct = round(len(matched) / total * 100) if total > 0 else 0
-
-        with c1:
-            st.markdown(f"""
-            <div class='stat-box'>
-                <div class='stat-num green'>{len(matched)}</div>
-                <div class='stat-lbl'>✅ Matched</div>
-            </div>""", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"""
-            <div class='stat-box'>
-                <div class='stat-num amber'>{len(pending)}</div>
-                <div class='stat-lbl'>⚠️ Pending (no PO)</div>
-            </div>""", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"""
-            <div class='stat-box'>
-                <div class='stat-num blue'>{len(unmatched_po)}</div>
-                <div class='stat-lbl'>📦 Unused POs</div>
-            </div>""", unsafe_allow_html=True)
-        with c4:
-            color = "green" if match_pct == 100 else ("amber" if match_pct >= 50 else "red")
-            st.markdown(f"""
-            <div class='stat-box'>
-                <div class='stat-num {color}'>{match_pct}%</div>
-                <div class='stat-lbl'>Match Rate</div>
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── Download ZIP ──────────────────────────────────────────────────────
-        # Use pre-built ZIP from session_state — avoids re-building on every Streamlit render
-        zip_data = st.session_state.get("matcher_zip")
-        if zip_data:
-            st.download_button(
-                f"⬇️ Download Results ZIP  ({len(matched)} matched · {len(pending)} pending)",
-                data=zip_data,
-                file_name=f"invoice_match_{date.today().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=False,
-            )
-            st.caption(
-                "ZIP contains: **matched/** — merged Invoice+PO PDFs · "
-                "**pending/** — original invoice PDFs with no PO match"
-            )
-
-        st.divider()
-
-        # ── Matched list ──────────────────────────────────────────────────────
-        if matched:
-            with st.expander(f"✅ Matched Invoices ({len(matched)})", expanded=True):
-                # Individual download buttons per merged PDF
-                for item in matched:
-                    col_a, col_b = st.columns([4, 1.5])
-                    with col_a:
-                        st.markdown(
-                            f"<div class='match-row'>"
-                            f"📄 <b>{item['invoice_name']}</b>"
-                            f"&nbsp;&nbsp;↔&nbsp;&nbsp;"
-                            f"📦 <b>{item['po_name']}</b>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with col_b:
-                        st.download_button(
-                            "⬇️ Download",
-                            data=item["merged_bytes"],
-                            file_name=item["invoice_name"],
-                            mime="application/pdf",
-                            key=f"mdl_{item['invoice_name']}",
-                            use_container_width=True,
-                        )
-
-        # ── Pending / unmatched invoices ──────────────────────────────────────
-        if pending:
-            with st.expander(f"⚠️ Unmatched Invoices ({len(pending)})", expanded=True):
-                st.caption("These invoices had no corresponding PO file. Check filenames and re-upload if needed.")
-                for item in pending:
-                    st.markdown(
-                        f"<div class='pending-row'>"
-                        f"📄 <b>{item['invoice_name']}</b>"
-                        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-                        f"PO searched: <code>{item['po_id']}</code>"
-                        f"&nbsp;&nbsp;—&nbsp;&nbsp;"
-                        f"{item['reason']}"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-        # ── Unused POs ────────────────────────────────────────────────────────
-        if unmatched_po:
-            with st.expander(f"📦 Unused POs ({len(unmatched_po)})"):
-                st.caption("These PO files were uploaded but no invoice referenced them.")
-                for po_name in unmatched_po:
-                    st.markdown(f"- `{po_name}.pdf`")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — DATABASE
+# TAB 5 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_db:
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
@@ -1149,8 +1415,9 @@ with tab_db:
             except Exception as e:
                 st.error(f"Error importing Excel: {e}")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — SETTINGS
+# TAB 6 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cfg:
     st.subheader("General Settings")
@@ -1203,7 +1470,19 @@ with tab_cfg:
 
     with st.expander("ℹ️ System Information"):
         st.markdown(f"""
-        **Atlantic Invoice Tools v2.0**
+        **Atlantic Invoice Tools v3.0**
+
+        **Workflow:**
+        1. **✂️ Split** — Upload Atlantic batch PDFs → auto-detect invoices → split into individual files
+           named `{{Invoice No}} {{CC}} {{BOL}}.pdf`
+        2. **🔗 Match** — Upload split invoices + PO PDFs → merge matched pairs
+        3. **📤 Codify** — Stamp invoices with Vendor / CC / GL / Date
+
+        **Split naming logic:**
+        - Invoice No: from `INVOICE No/No DE FACTURE` field
+        - CC: first 2 chars of Customer Order No. → lookup in Vendor table → first 2 chars of `cc` field
+          *(e.g. MD → EV01 → **EV**)*
+        - BOL: second line of Bill of Lading column if two lines exist, otherwise the single line value
 
         **Coding logic:**
         - The first **2 characters** of the Customer Order No. determine the CC prefix
@@ -1211,20 +1490,6 @@ with tab_cfg:
         - The **Product Code** is extracted from the invoice and looked up in the **GL table** → GL Account
         - **Type-6 invoice exception:** if the invoice No. starts with `6` →
           Vendor = `{VENDOR_EXCEPCION}` (fixed), CC = manual user selection
-
-        **Stamp format:**
-        ```
-        POSTED BY: [user]
-        VENDOR: [vendor number]
-        CC: [cost centre]  |  GL: [GL account]
-        DATE: [DD/MM/YYYY]
-        ```
-
-        **Matching logic:**
-        - Invoice filename: `InvoiceNo CostCentre PONumber.pdf` → 3rd space-separated part = PO ID
-        - PO filename: `PONumber.pdf` (exact match, case-insensitive)
-        - Flattening: pikepdf structural repair → fallback to pdf2image rasterization
-        - Output: Invoice pages + PO pages merged into one PDF
 
         **Vendors in database:** {len(st.session_state.proveedores)}
         **GL codes in database:** {len(st.session_state.gl_codes)}
