@@ -167,9 +167,9 @@ def _splitter_extract_order_no(lines: list) -> str | None:
     Returns the full order number e.g. 'ML11465'.
     """
     for line in lines:
-        m = re.search(r"\d{6}\s+\d{2,3}\s+([A-Z]{2}\d{4,7})\b", line)
+        m = re.search(r"\d{6}\s+\d{2,3}\s+([A-Za-z]{2}\d{4,7})\b", line, re.IGNORECASE)
         if m:
-            return m.group(1)
+            return m.group(1).upper()
     return None
 
 
@@ -194,17 +194,17 @@ def _splitter_extract_bol(lines: list) -> str | None:
     #   • Letter+digits : C249328           (layout C — letter-prefixed BOL)
     # [A-Z]? makes the leading letter optional, covering all three layouts.
     for line in lines:
-        m = re.match(r"^([A-Z]?\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip())
+        m = re.match(r"^([A-Za-z]?\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
         if m:
-            return m.group(1)
+            return m.group(1).upper()
 
     # Fallback: alphanumeric single-line BOL (e.g. C0012857, N0089112)
     # Product code after qty can be alphabetic (CAWT25) OR numeric (001912) —
     # only require: letter + 5-9 digits, space, qty digits, space
     for line in lines:
-        m = re.match(r"^([A-Z]\d{5,9})\s+\d+\s", line.strip())
+        m = re.match(r"^([A-Za-z]\d{5,9})\s+\d+\s", line.strip(), re.IGNORECASE)
         if m:
-            return m.group(1)
+            return m.group(1).upper()
 
     return None
 
@@ -368,9 +368,9 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
                 result["is_six"] = result["invoice_no"].startswith("6")
 
         for line in lines:
-            m = re.search(r"\d{6}\s+\d{2,3}\s+\|?\s*([A-Z]{2}\d{4,7})\b", line)
+            m = re.search(r"\d{6}\s+\d{2,3}\s+\|?\s*([A-Za-z]{2}\d{4,7})\b", line, re.IGNORECASE)
             if m:
-                result["customer_order"] = m.group(1)
+                result["customer_order"] = m.group(1).upper()
                 result["cc_prefix"] = m.group(1)[:2].upper()
                 break
 
