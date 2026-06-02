@@ -194,7 +194,7 @@ def _splitter_extract_bol(lines: list) -> str | None:
     #   • Letter+digits : C249328           (layout C — letter-prefixed BOL)
     # [A-Z]? makes the leading letter optional, covering all three layouts.
     for line in lines:
-        m = re.match(r"^([A-Za-z]?\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
+        m = re.match(r"^([A-Za-z]{0,2}\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
         if m:
             return m.group(1).upper()
 
