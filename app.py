@@ -1407,25 +1407,46 @@ with tab_db:
         if xl_up:
             try:
                 wb = openpyxl.load_workbook(xl_up)
+                imported_vendors = 0
+                imported_gl = 0
+
                 if "proveedores" in wb.sheetnames:
                     ws = wb["proveedores"]
-                    rows = list(ws.iter_rows(min_row=2, values_only=True))
-                    st.session_state.proveedores = [
-                        {"prefijo": str(r[0]), "vendor": str(r[1]), "cc": str(r[2])}
-                        for r in rows if r[0]
-                    ]
+                    new_proveedores = []
+                    for r in ws.iter_rows(min_row=2, values_only=True):
+                        if len(r) >= 3 and r[0] not in (None, ""):
+                            new_proveedores.append({
+                                "prefijo": str(r[0]).strip(),
+                                "vendor":  str(r[1]).strip() if r[1] is not None else "",
+                                "cc":      str(r[2]).strip() if r[2] is not None else "",
+                            })
+                    if new_proveedores:
+                        st.session_state.proveedores = new_proveedores
+                        imported_vendors = len(new_proveedores)
+
                 if "cuentas_gl" in wb.sheetnames:
                     ws = wb["cuentas_gl"]
-                    rows = list(ws.iter_rows(min_row=2, values_only=True))
-                    st.session_state.gl_codes = [
-                        {"codigo": str(r[0]), "gl": str(r[1])}
-                        for r in rows if r[0] and r[1]
-                    ]
-                st.success(
-                    f"✅ Imported: {len(st.session_state.proveedores)} vendors, "
-                    f"{len(st.session_state.gl_codes)} GL codes"
-                )
-                st.rerun()
+                    new_gl = []
+                    for r in ws.iter_rows(min_row=2, values_only=True):
+                        if len(r) >= 2 and r[0] not in (None, "") and r[1] not in (None, ""):
+                            new_gl.append({
+                                "codigo": str(r[0]).strip(),
+                                "gl":     str(r[1]).strip(),
+                            })
+                    if new_gl:
+                        st.session_state.gl_codes = new_gl
+                        imported_gl = len(new_gl)
+
+                if imported_vendors == 0 and imported_gl == 0:
+                    st.warning(
+                        "⚠️ No data imported. Make sure the Excel has sheets named "
+                        "**'proveedores'** and/or **'cuentas_gl'** with data starting on row 2."
+                    )
+                else:
+                    st.success(
+                        f"✅ Imported: {imported_vendors} vendors, {imported_gl} GL codes"
+                    )
+                    st.rerun()
             except Exception as e:
                 st.error(f"Error importing Excel: {e}")
 
