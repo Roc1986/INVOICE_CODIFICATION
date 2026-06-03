@@ -1102,8 +1102,10 @@ with tab_proc:
 
             if is_six:
                 data["vendor_auto"] = VENDOR_EXCEPCION
-                data["cc_auto"]     = None
-                data["needs_cc"]    = True
+                prefix = data.get("cc_prefix")
+                _, c = get_vendor_cc(prefix) if prefix else (None, None)
+                data["cc_auto"]  = c
+                data["needs_cc"] = (c is None)
             else:
                 prefix = data.get("cc_prefix")
                 v, c = get_vendor_cc(prefix) if prefix else (None, None)
@@ -1162,10 +1164,14 @@ with tab_proc:
                     if inv["is_six"]:
                         st.write(f"Vendor (fixed): `{VENDOR_EXCEPCION}`")
                         resolved_vendor[idx] = VENDOR_EXCEPCION
-                        cc_opts = sorted(set(r["cc"] for r in st.session_state.proveedores))
-                        sel_cc = st.selectbox("Select CC:", cc_opts, key=f"cc6_{idx}")
-                        resolved_cc[idx] = sel_cc
-                        st.success(f"CC selected: `{sel_cc}`")
+                        if inv["cc_auto"]:
+                            st.success(f"CC: `{inv['cc_auto']}`")
+                            resolved_cc[idx] = inv["cc_auto"]
+                        else:
+                            st.warning("CC prefix not detected — select manually")
+                            cc_opts = sorted(set(r["cc"] for r in st.session_state.proveedores))
+                            sel_cc = st.selectbox("Select CC:", cc_opts, key=f"cc6_{idx}")
+                            resolved_cc[idx] = sel_cc
                     elif inv["vendor_auto"] and inv["cc_auto"]:
                         st.success(f"Vendor: `{inv['vendor_auto']}`")
                         st.success(f"CC: `{inv['cc_auto']}`")
