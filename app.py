@@ -865,6 +865,10 @@ with tab_split:
             with col_info:
                 pages_str = ", ".join(str(p) for p in item["source_pages"])
                 page_lbl  = f"{item['page_count']} page{'s' if item['page_count'] > 1 else ''}"
+                warn_html = (
+                    f"<br><span style='color:#e08000;font-size:12px'>{item['warning']}</span>"
+                    if item["warning"] else ""
+                )
                 st.markdown(
                     f"<div class='{row_cls}'>"
                     f"{icon} <b>{item['filename']}</b>"
@@ -873,7 +877,7 @@ with tab_split:
                     f"CC: <code>{item['cc']}</code> &nbsp; "
                     f"BOL: <code>{item['bol']}</code> &nbsp; "
                     f"· {page_lbl} (source p. {pages_str})"
-                    f"{'<br><span style=\"color:#e08000;font-size:12px\">' + item['warning'] + '</span>' if item['warning'] else ''}"
+                    f"{warn_html}"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
