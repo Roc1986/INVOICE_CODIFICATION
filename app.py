@@ -748,11 +748,10 @@ st.markdown("""
 <p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_split, tab_match, tab_proc, tab_res, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_cod, tab_db, tab_cfg = st.tabs([
     "✂️  Invoice Splitter",
     "🔗  Invoice Matcher",
-    "📤  Process Invoices",
-    "📋  Results",
+    "🏷️  Invoice Coding",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -1064,15 +1063,14 @@ with tab_match:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — PROCESS INVOICES (CODIFIER)
+# TAB 3 — INVOICE CODING (upload + review + results unified)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_proc:
-    st.subheader("Upload Invoice PDFs")
-
+with tab_cod:
     if "upload_key" not in st.session_state:
         st.session_state.upload_key = 0
 
-    col_up, col_clear = st.columns([5, 1])
+    # ── Top toolbar: upload + clear all ──────────────────────────────────────
+    col_up, col_clear_upload, col_clear_all = st.columns([5, 1, 1])
     with col_up:
         uploaded = st.file_uploader(
             "Drag or select one or more PDFs",
@@ -1081,15 +1079,24 @@ with tab_proc:
             help="Supports bulk upload. Only the first page of each invoice is stamped.",
             key=f"uploader_{st.session_state.upload_key}",
         )
-    with col_clear:
+    with col_clear_upload:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🗑️ Clear\nupload", use_container_width=True,
-                     help="Remove all loaded files to upload a new batch"):
+        if st.button("🗑️ Clear\nfiles", use_container_width=True,
+                     help="Remove uploaded files to load a new batch"):
             st.session_state.upload_key += 1
             st.rerun()
+    with col_clear_all:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear\nall", use_container_width=True,
+                     help="Clear uploaded files AND all coded results"):
+            st.session_state.processed    = []
+            st.session_state.upload_key  += 1
+            st.rerun()
 
+    # ── Upload / review section ───────────────────────────────────────────────
     if not uploaded:
-        st.info("📂 Upload invoices to get started. You can select multiple files at once.")
+        if not st.session_state.processed:
+            st.info("📂 Upload invoices to get started. You can select multiple files at once.")
     else:
         st.success(f"✅ **{len(uploaded)} file(s)** loaded — analyzing…")
         st.divider()
@@ -1101,9 +1108,7 @@ with tab_proc:
             data["filename"] = f.name
             data["raw_bytes"] = raw
 
-            inv_no = data.get("invoice_no") or ""
             is_six = data.get("is_six", False)
-
             if is_six:
                 data["vendor_auto"] = VENDOR_EXCEPCION
                 prefix = data.get("cc_prefix")
@@ -1127,14 +1132,7 @@ with tab_proc:
         resolved_gl     = {}
 
         for idx, inv in enumerate(invoices_ui):
-            all_ok = (
-                inv.get("invoice_no")
-                and not inv["needs_cc"]
-                and inv.get("gl_auto")
-            )
-            has_err = inv.get("error") or (
-                not inv.get("invoice_no") and not inv.get("customer_order")
-            )
+            has_err     = inv.get("error") or (not inv.get("invoice_no") and not inv.get("customer_order"))
             needs_input = inv["needs_cc"] or not inv.get("gl_auto")
 
             if has_err:
@@ -1203,10 +1201,10 @@ with tab_proc:
                         sel_gl = st.selectbox("Manual GL:", gl_opts, key=f"glman_{idx}")
                         resolved_gl[idx] = sel_gl
 
-                cc_prev  = resolved_cc.get(idx, "??")
-                gl_prev  = resolved_gl.get(idx, "??")
-                vd_prev  = resolved_vendor.get(idx, "??")
-                usr_prev = current_user or "???"
+                cc_prev   = resolved_cc.get(idx, "??")
+                gl_prev   = resolved_gl.get(idx, "??")
+                vd_prev   = resolved_vendor.get(idx, "??")
+                usr_prev  = current_user or "???"
                 date_prev = coding_date.strftime("%d/%m/%Y")
                 st.markdown(f"""
                 <div style='margin-top:10px'>
@@ -1223,7 +1221,7 @@ with tab_proc:
         col_btn, col_info = st.columns([1, 3])
         with col_btn:
             do_process = st.button(
-                "🚀 Process Invoices",
+                "🚀 Code Invoices",
                 type="primary",
                 use_container_width=True,
                 disabled=not bool(current_user),
@@ -1236,8 +1234,8 @@ with tab_proc:
             progress = st.progress(0, text="Starting…")
             errors = []
             for idx, inv in enumerate(invoices_ui):
-                fname = inv["filename"]
-                progress.progress((idx + 1) / len(invoices_ui), text=f"Processing {fname}…")
+                fname  = inv["filename"]
+                progress.progress((idx + 1) / len(invoices_ui), text=f"Coding {fname}…")
                 cc     = resolved_cc.get(idx, "???")
                 vendor = resolved_vendor.get(idx, "???")
                 gl     = resolved_gl.get(idx, "???")
@@ -1263,25 +1261,20 @@ with tab_proc:
                 for err in errors:
                     st.error(err)
             else:
-                st.success(f"🎉 **{len(invoices_ui)} invoice(s)** coded successfully. Go to **Results** to download them.")
+                st.success(f"🎉 **{len(invoices_ui)} invoice(s)** coded successfully.")
                 st.balloons()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — RESULTS
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_res:
-    if not st.session_state.processed:
-        st.info("📭 No invoices processed yet. Go to **Process Invoices** to begin.")
-    else:
+    # ── Results section (always visible when there are coded invoices) ────────
+    if st.session_state.processed:
         n = len(st.session_state.processed)
-        st.subheader(f"Processed Invoices — {n} file(s)")
-
-        col_dl, col_del, _ = st.columns([2, 2, 5])
-        with col_dl:
+        st.divider()
+        col_hdr, col_zip, col_del = st.columns([3, 2, 1])
+        with col_hdr:
+            st.subheader(f"📋 Coded Invoices — {n} file(s)")
+        with col_zip:
             zip_all = make_zip(st.session_state.processed)
             st.download_button(
-                f"⬇️ Download ZIP ({n} invoices)",
+                f"⬇️ Download ZIP ({n})",
                 data=zip_all,
                 file_name=f"coded_invoices_{date.today().strftime('%Y%m%d')}.zip",
                 mime="application/zip",
@@ -1292,8 +1285,6 @@ with tab_res:
             if st.button("🗑️ Delete all", use_container_width=True):
                 st.session_state.processed = []
                 st.rerun()
-
-        st.divider()
 
         with st.expander("📅 Modify Coding Date"):
             st.caption("Use this if the invoice could not be registered on the same day it was coded.")
@@ -1324,7 +1315,6 @@ with tab_res:
                     st.rerun()
 
         st.divider()
-
         to_delete = []
         for i, item in enumerate(st.session_state.processed):
             col1, col2, col3, col4 = st.columns([4, 1.5, 1, 1])
@@ -1333,7 +1323,7 @@ with tab_res:
                 st.caption(
                     f"Vendor: `{item['vendor']}` | CC: `{item['cc']}` | "
                     f"GL: `{item['gl']}` | By: **{item['user']}** | "
-                    f"Date: `{item['date']}` | Processed: {item['ts']}"
+                    f"Date: `{item['date']}` | Coded: {item['ts']}"
                 )
             with col2:
                 st.download_button(
