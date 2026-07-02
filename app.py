@@ -856,7 +856,7 @@ with tab_split:
         st.divider()
 
         # Per-invoice rows
-        for item in results:
+        for row_idx, item in enumerate(results):
             row_cls = "split-row split-warn" if item["warning"] else "split-row"
             icon    = "⚠️" if item["warning"] else "✅"
 
@@ -886,7 +886,7 @@ with tab_split:
                     data=item["pdf_bytes"],
                     file_name=item["filename"],
                     mime="application/pdf",
-                    key=f"spdl_{item['filename']}_{item['invoice_no']}",
+                    key=f"spdl_{row_idx}",
                     use_container_width=True,
                     help=f"Download {item['filename']}",
                 )
