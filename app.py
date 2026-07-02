@@ -626,6 +626,100 @@ def make_matcher_zip(results: dict) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── COURU CODE FUNCTIONS ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_couru_data(pdf_bytes: bytes, filename: str = "") -> dict:
+    result = {
+        "invoice_no": None, "date": None,
+        "gl": None, "cc": None, "subtotal": None, "error": None,
+    }
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                result["error"] = "Empty PDF"
+                return result
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+            text_upper = full_text.upper()
+            lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+            # Invoice number
+            for i, line in enumerate(lines):
+                if "INVOICE NO" in line.upper() and "FACTURE" in line.upper():
+                    m = re.search(r"(\d{7,10})\s*$", line)
+                    if m:
+                        result["invoice_no"] = m.group(1)
+                        break
+                    for j in range(max(0, i - 5), i):
+                        if re.fullmatch(r"\d{6,10}", lines[j]):
+                            result["invoice_no"] = lines[j]
+                            break
+                    break
+            if not result["invoice_no"] and filename:
+                m = re.match(r"(\d{6,10})", filename)
+                if m:
+                    result["invoice_no"] = m.group(1)
+
+            # Invoice date — last date on the customer-order header line
+            date_pat = r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})'
+            for line in lines:
+                if re.search(r'\d{6}\s+\d{2,3}\s+[A-Za-z]{2}\d+', line, re.IGNORECASE):
+                    dates = re.findall(date_pat, line, re.IGNORECASE)
+                    if dates:
+                        result["date"] = dates[-1]
+                        break
+            if not result["date"]:
+                m = re.search(date_pat, full_text, re.IGNORECASE)
+                if m:
+                    result["date"] = m.group(1)
+
+            # CC from customer order prefix
+            for line in lines:
+                m = re.search(r"\d{6}\s+\d{2,3}\s+\|?\s*([A-Za-z]{2}\d{4,7})\b", line, re.IGNORECASE)
+                if m:
+                    _, cc = get_vendor_cc(m.group(1)[:2].upper())
+                    result["cc"] = cc
+                    break
+
+            # GL from product codes
+            known_codes = sorted(
+                [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
+                key=len, reverse=True,
+            )
+            for code in known_codes:
+                if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
+                    result["gl"] = get_gl(code)
+                    break
+
+            # Subtotal (total before taxes) — find amount near "Sub Total" label
+            for i, line in enumerate(lines):
+                if re.search(r'\bsub\s*total\b', line, re.IGNORECASE):
+                    amounts = re.findall(r'[\d,]+\.\d{2}', line)
+                    if amounts:
+                        result["subtotal"] = amounts[0].replace(",", "")
+                        break
+                    for j in range(max(0, i - 4), i):
+                        amounts = re.findall(r'^([\d,]+\.\d{2})$', lines[j])
+                        if amounts:
+                            result["subtotal"] = amounts[0].replace(",", "")
+                            break
+                    if result["subtotal"]:
+                        break
+                    for j in range(i + 1, min(len(lines), i + 3)):
+                        amounts = re.findall(r'([\d,]+\.\d{2})', lines[j])
+                        if amounts:
+                            result["subtotal"] = amounts[0].replace(",", "")
+                            break
+                    break
+
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSS STYLES
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -748,10 +842,11 @@ st.markdown("""
 <p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_split, tab_match, tab_cod, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_cod, tab_couru, tab_db, tab_cfg = st.tabs([
     "✂️  Invoice Splitter",
     "🔗  Invoice Matcher",
     "🏷️  Invoice Coding",
+    "📊  Couru Code",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -1345,6 +1440,101 @@ with tab_cod:
             for i in sorted(to_delete, reverse=True):
                 st.session_state.processed.pop(i)
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — COURU CODE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_couru:
+    st.subheader("📊 Couru Code — Invoice Report")
+    st.markdown(
+        "Upload invoice PDFs to extract key data and download an Excel report "
+        "with invoice number, date, GL account, cost centre, and subtotal before taxes."
+    )
+
+    if "couru_upload_key" not in st.session_state:
+        st.session_state.couru_upload_key = 0
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        couru_files = st.file_uploader(
+            "Drag or select one or more invoice PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"couru_uploader_{st.session_state.couru_upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="couru_clear"):
+            st.session_state.couru_upload_key += 1
+            st.session_state.pop("couru_results", None)
+            st.rerun()
+
+    if not couru_files:
+        st.info("📂 Upload invoice PDFs to get started.")
+    else:
+        st.success(f"✅ **{len(couru_files)} file(s)** loaded")
+
+        if st.button("📊 Generate Excel Report", type="primary", key="couru_run"):
+            couru_data = []
+            prog = st.progress(0, text="Extracting…")
+            for fi, f in enumerate(couru_files):
+                prog.progress((fi + 1) / len(couru_files), text=f"Processing {f.name}…")
+                raw = f.read()
+                d = extract_couru_data(raw, f.name)
+                couru_data.append({
+                    "Invoice No": d["invoice_no"] or "—",
+                    "Date":       d["date"]       or "—",
+                    "GL":         d["gl"]         or "—",
+                    "CC":         d["cc"]         or "—",
+                    "Subtotal":   d["subtotal"]   or "—",
+                    "Error":      d["error"]      or "",
+                })
+            prog.progress(1.0, text="✅ Done")
+            st.session_state["couru_results"] = couru_data
+
+        if st.session_state.get("couru_results"):
+            rows = st.session_state["couru_results"]
+            df = pd.DataFrame(rows)
+
+            n_ok   = sum(1 for r in rows if not r["Error"] and r["Invoice No"] != "—")
+            n_warn = sum(1 for r in rows if r["Error"] or r["GL"] == "—" or r["CC"] == "—")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num blue'>{len(rows)}</div>"
+                    f"<div class='stat-lbl'>Invoices processed</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num green'>{n_ok}</div>"
+                    f"<div class='stat-lbl'>Complete</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num amber'>{n_warn}</div>"
+                    f"<div class='stat-lbl'>Need review</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            buf = BytesIO()
+            display_df = df.drop(columns=["Error"]) if all(r == "" for r in df["Error"]) else df
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                display_df.to_excel(writer, index=False)
+            buf.seek(0)
+            st.download_button(
+                f"⬇️ Download Excel ({len(rows)} invoices)",
+                data=buf.read(),
+                file_name=f"couru_report_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
