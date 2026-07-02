@@ -1560,10 +1560,18 @@ with tab_db:
             key="prov_editor",
         )
         if st.button("💾 Save changes — Vendors", type="primary"):
-            st.session_state.proveedores = [
-                r for r in edited_prov.to_dict("records") if r.get("prefijo")
-            ]
-            st.success("✅ Vendor table updated")
+            new_prov = []
+            for r in edited_prov.to_dict("records"):
+                pref = r.get("prefijo")
+                if pref and str(pref).strip() and str(pref).strip().upper() != "NAN":
+                    new_prov.append({
+                        "prefijo": str(pref).strip().upper(),
+                        "vendor":  str(r.get("vendor", "")).strip(),
+                        "cc":      str(r.get("cc", "")).strip(),
+                    })
+            st.session_state.proveedores = new_prov
+            st.success(f"✅ Vendor table updated — {len(new_prov)} vendors saved")
+            st.rerun()
 
     with db_t2:
         st.subheader("GL Codes Table")
@@ -1580,10 +1588,18 @@ with tab_db:
             key="gl_editor",
         )
         if st.button("💾 Save changes — GL", type="primary"):
-            st.session_state.gl_codes = [
-                r for r in edited_gl.to_dict("records") if r.get("codigo")
-            ]
-            st.success("✅ GL table updated")
+            new_gl = []
+            for r in edited_gl.to_dict("records"):
+                cod = r.get("codigo")
+                gl  = r.get("gl")
+                if cod and str(cod).strip() and str(cod).strip().upper() != "NAN":
+                    new_gl.append({
+                        "codigo": str(cod).strip().upper(),
+                        "gl":     str(gl).strip() if gl and str(gl).strip().upper() != "NAN" else "",
+                    })
+            st.session_state.gl_codes = new_gl
+            st.success(f"✅ GL table updated — {len(new_gl)} codes saved")
+            st.rerun()
 
         st.divider()
         st.subheader("📥 Import from Excel (maestro_contable.xlsx)")
