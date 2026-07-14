@@ -378,10 +378,11 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
             [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
             key=len, reverse=True,
         )
-        for code in known_codes:
-            if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
-                result["product_code"] = code
-                break
+        if known_codes:
+            _pat = r"\b(?:" + "|".join(re.escape(c) for c in known_codes) + r")\b"
+            _m = re.search(_pat, text_upper)
+            if _m:
+                result["product_code"] = _m.group(0)
 
     except Exception as e:
         result["error"] = str(e)
@@ -480,6 +481,19 @@ def make_zip(items):
             zf.writestr(item["filename"], item["pdf_bytes"])
     buf.seek(0)
     return buf.read()
+
+
+def _get_processed_zip() -> bytes:
+    items = st.session_state.processed
+    if not items:
+        return b""
+    sig = tuple(item["filename"] for item in items)
+    if st.session_state.get("_proc_zip_sig") == sig and st.session_state.get("_proc_zip"):
+        return st.session_state["_proc_zip"]
+    z = make_zip(items)
+    st.session_state["_proc_zip"]     = z
+    st.session_state["_proc_zip_sig"] = sig
+    return z
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -688,10 +702,11 @@ def extract_couru_data(pdf_bytes: bytes, filename: str = "") -> dict:
                 [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
                 key=len, reverse=True,
             )
-            for code in known_codes:
-                if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
-                    result["gl"] = get_gl(code)
-                    break
+            if known_codes:
+                _pat = r"\b(?:" + "|".join(re.escape(c) for c in known_codes) + r")\b"
+                _m = re.search(_pat, text_upper)
+                if _m:
+                    result["gl"] = get_gl(_m.group(0))
 
             # Subtotal (total before taxes) — find amount near "Sub Total" label
             for i, line in enumerate(lines):
@@ -796,7 +811,7 @@ with st.sidebar:
     st.metric("Coded Invoices", n_proc)
 
     if n_proc > 0:
-        zip_bytes = make_zip(st.session_state.processed)
+        zip_bytes = _get_processed_zip()
         st.download_button(
             "⬇️ Download ZIP (all)",
             data=zip_bytes,
@@ -1190,35 +1205,41 @@ with tab_cod:
 
     # ── Upload / review section ───────────────────────────────────────────────
     if not uploaded:
+        st.session_state.pop("_inv_ui_cache", None)
+        st.session_state.pop("_inv_ui_sig", None)
         if not st.session_state.processed:
             st.info("📂 Upload invoices to get started. You can select multiple files at once.")
     else:
         st.success(f"✅ **{len(uploaded)} file(s)** loaded — analyzing…")
         st.divider()
 
-        invoices_ui = []
-        for idx, f in enumerate(uploaded):
-            raw = f.read()
-            data = extract_invoice_data(raw, f.name)
-            data["filename"] = f.name
-            data["raw_bytes"] = raw
-
-            is_six = data.get("is_six", False)
-            if is_six:
-                data["vendor_auto"] = VENDOR_EXCEPCION
-                prefix = data.get("cc_prefix")
-                _, c = get_vendor_cc(prefix) if prefix else (None, None)
-                data["cc_auto"]  = c
-                data["needs_cc"] = (c is None)
-            else:
-                prefix = data.get("cc_prefix")
-                v, c = get_vendor_cc(prefix) if prefix else (None, None)
-                data["vendor_auto"] = v
-                data["cc_auto"]     = c
-                data["needs_cc"]    = (v is None or c is None)
-
-            data["gl_auto"] = get_gl(data.get("product_code"))
-            invoices_ui.append(data)
+        # Re-parse PDFs only when the set of uploaded files changes
+        _sig = tuple((f.name, f.size) for f in uploaded)
+        if _sig != st.session_state.get("_inv_ui_sig"):
+            _inv_ui = []
+            for f in uploaded:
+                raw = f.read()
+                data = extract_invoice_data(raw, f.name)
+                data["filename"] = f.name
+                data["raw_bytes"] = raw
+                is_six = data.get("is_six", False)
+                if is_six:
+                    data["vendor_auto"] = VENDOR_EXCEPCION
+                    prefix = data.get("cc_prefix")
+                    _, c = get_vendor_cc(prefix) if prefix else (None, None)
+                    data["cc_auto"]  = c
+                    data["needs_cc"] = (c is None)
+                else:
+                    prefix = data.get("cc_prefix")
+                    v, c = get_vendor_cc(prefix) if prefix else (None, None)
+                    data["vendor_auto"] = v
+                    data["cc_auto"]     = c
+                    data["needs_cc"]    = (v is None or c is None)
+                data["gl_auto"] = get_gl(data.get("product_code"))
+                _inv_ui.append(data)
+            st.session_state["_inv_ui_cache"] = _inv_ui
+            st.session_state["_inv_ui_sig"]   = _sig
+        invoices_ui = st.session_state["_inv_ui_cache"]
 
         st.subheader("Review — Extracted Data")
 
@@ -1367,7 +1388,7 @@ with tab_cod:
         with col_hdr:
             st.subheader(f"📋 Coded Invoices — {n} file(s)")
         with col_zip:
-            zip_all = make_zip(st.session_state.processed)
+            zip_all = _get_processed_zip()
             st.download_button(
                 f"⬇️ Download ZIP ({n})",
                 data=zip_all,
