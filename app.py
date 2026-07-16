@@ -328,20 +328,13 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
             if not pdf.pages:
                 result["error"] = "Empty PDF"
                 return result
-            # Extract text from ALL pages (product code can appear on any page)
-            text = "\n".join(
-                (p.extract_text() or "") for p in pdf.pages
-            )
+            text = pdf.pages[0].extract_text() or ""
 
         if len(text.strip()) < 50:
             if OCR_AVAILABLE:
                 try:
-                    # 300 DPI gives better quality for small invoice text
-                    images = convert_from_bytes(pdf_bytes, dpi=300)
-                    text = "\n".join(
-                        pytesseract.image_to_string(img, config="--psm 6")
-                        for img in images
-                    )
+                    images = convert_from_bytes(pdf_bytes, first_page=1, last_page=1, dpi=200)
+                    text = pytesseract.image_to_string(images[0])
                     result["ocr_used"] = True
                 except Exception as ocr_err:
                     result["error"] = f"OCR failed: {ocr_err}"
@@ -385,18 +378,10 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
             [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
             key=len, reverse=True,
         )
-        if known_codes:
-            # Primary: strict word-boundary search
-            _pat_wb = r"\b(?:" + "|".join(re.escape(c) for c in known_codes) + r")\b"
-            _m = re.search(_pat_wb, text_upper)
-            if _m:
-                result["product_code"] = _m.group(0)
-            else:
-                # Fallback: plain substring search (catches OCR spacing artifacts)
-                for code in known_codes:
-                    if code in text_upper:
-                        result["product_code"] = code
-                        break
+        for code in known_codes:
+            if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
+                result["product_code"] = code
+                break
 
     except Exception as e:
         result["error"] = str(e)
@@ -1227,8 +1212,12 @@ with tab_cod:
         st.success(f"✅ **{len(uploaded)} file(s)** loaded — analyzing…")
         st.divider()
 
-        # Re-parse PDFs only when the set of uploaded files changes
-        _sig = tuple((f.name, f.size) for f in uploaded)
+        # Re-parse PDFs only when files OR the GL/vendor database changes
+        _sig = (
+            tuple((f.name, f.size) for f in uploaded),
+            tuple(r["codigo"] for r in st.session_state.gl_codes),
+            tuple(r["prefijo"] for r in st.session_state.proveedores),
+        )
         if _sig != st.session_state.get("_inv_ui_sig"):
             _inv_ui = []
             for f in uploaded:
