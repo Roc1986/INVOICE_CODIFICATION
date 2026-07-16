@@ -336,12 +336,8 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
         if len(text.strip()) < 50:
             if OCR_AVAILABLE:
                 try:
-                    # 300 DPI gives better quality for small invoice text
-                    images = convert_from_bytes(pdf_bytes, dpi=300)
-                    text = "\n".join(
-                        pytesseract.image_to_string(img, config="--psm 6")
-                        for img in images
-                    )
+                    images = convert_from_bytes(pdf_bytes, first_page=1, last_page=1, dpi=200)
+                    text = pytesseract.image_to_string(images[0])
                     result["ocr_used"] = True
                 except Exception as ocr_err:
                     result["error"] = f"OCR failed: {ocr_err}"
