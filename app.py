@@ -884,7 +884,9 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
         apinv_rows: list = []
         for yk in sorted_ys:
             row_ws = row_map[yk]
-            row_tx = " ".join(w["text"] for w in row_ws)
+            # Sort left-to-right so the regex finds "APINV <number>" in order
+            row_ws_x = sorted(row_ws, key=lambda w: w["x0"])
+            row_tx = " ".join(w["text"] for w in row_ws_x)
             if "APINV" not in row_tx.upper():
                 continue
 
@@ -896,7 +898,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
 
             # Fallback: find "APINV" word, then look right across nearby y-bands
             apinv_x1 = None
-            for w in row_ws:
+            for w in row_ws_x:
                 if "APINV" in w["text"].upper():
                     apinv_x1 = w["x1"]
                     break
@@ -941,9 +943,12 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                     cc = mc.group(1).upper()
                     break
 
-            # Dates: APINV row (yk) ± 5 above, + 35 below = covers due-date line
-            # The ±5 above handles slight baseline differences in Crystal Reports
-            date_band_ys = [y for y in sorted_ys if yk - 5 <= y <= yk + 35]
+            # Dates: APINV row ±15 above + 45 below.
+            # Crystal Reports can place the date column up to ~12 pt above or
+            # below the "APINV" text baseline; +45 captures the due-date line
+            # even with generous line spacing.  ISO dates are specific enough
+            # (YYYY-MM-DD) that false positives from sub-rows are not a risk.
+            date_band_ys = [y for y in sorted_ys if yk - 15 <= y <= yk + 45]
             date_items: list = []
             for y in date_band_ys:
                 for w in row_map.get(y, []):
