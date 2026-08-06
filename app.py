@@ -15,7 +15,7 @@ import re
 import copy
 import json
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import openpyxl
 
 # ── Optional OCR support ──────────────────────────────────────────────────────
@@ -111,6 +111,9 @@ def init_state():
         "splitter_results":    [],   # [{"filename", "pdf_bytes", "invoice_no", "cc", "bol", "pages", "warning"}]
         "splitter_zip":        None,
         "splitter_upload_key": 0,
+        # AP Audit state
+        "audit_results":       None,
+        "audit_data_count":    0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -734,6 +737,167 @@ def extract_couru_data(pdf_bytes: bytes, filename: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── AP AUDIT VALIDATION FUNCTIONS ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_date_str(s: str) -> "date | None":
+    """Parse a date string in multiple formats → date object."""
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in (
+        "%d %b %Y", "%d %B %Y",
+        "%d-%b-%Y", "%d-%B-%Y",
+        "%d-%b-%y", "%d-%B-%y",
+        "%d/%m/%Y", "%m/%d/%Y",
+        "%Y-%m-%d", "%Y/%m/%d",
+    ):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def calc_due_date(invoice_date) -> "date | None":
+    """
+    Quincena rule: invoice_date + 60 days → round UP to the 15th or 30th.
+    The second quincena is always the 30th (never 31).
+    """
+    if isinstance(invoice_date, str):
+        invoice_date = _parse_date_str(invoice_date)
+    if not invoice_date:
+        return None
+    base = invoice_date + timedelta(days=60)
+    if base.day <= 15:
+        return date(base.year, base.month, 15)
+    return date(base.year, base.month, 30)
+
+
+def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
+    """
+    Extract the INVOICE DATE from an Atlantic invoice PDF.
+    Tries: 1) 'INVOICE DATE' label search  2) last date on the customer-order line.
+    """
+    date_pat = r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})'
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+            lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+            # Method 1: find 'INVOICE DATE' label and grab the adjacent date
+            for i, line in enumerate(lines):
+                if re.search(r'INVOICE\s+DATE', line, re.IGNORECASE):
+                    window = " ".join(lines[i:min(i + 3, len(lines))])
+                    m = re.search(date_pat, window, re.IGNORECASE)
+                    if m:
+                        return _parse_date_str(m.group(1))
+
+            # Method 2: last date on the customer-order header line
+            for line in lines:
+                if re.search(r'\d{6}\s+\d{2,3}\s+[A-Za-z]{2}\d+', line, re.IGNORECASE):
+                    dates = re.findall(date_pat, line, re.IGNORECASE)
+                    if dates:
+                        return _parse_date_str(dates[-1])
+    except Exception:
+        pass
+    return None
+
+
+def parse_audit_report(pdf_bytes: bytes) -> dict:
+    """
+    Parse the A/P Voucher Audit Listing PDF (Crystal Reports format).
+    Returns a dict keyed by invoice_no (Reference field):
+      { "invoice_date": date|None, "due_date": date|None,
+        "cc": str|None, "vendor": str|None, "gl": str|None }
+    """
+    records = {}
+    known_ccs = {r["cc"].upper() for r in st.session_state.proveedores}
+
+    # Date patterns found in Crystal Reports PDFs
+    _date_pats = [
+        r'\b(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4})\b',
+        r'\b(\d{2}/\d{2}/\d{4})\b',
+        r'\b(\d{4}-\d{2}-\d{2})\b',
+        r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})\b',
+    ]
+
+    def _extract_fields(context: str):
+        """Extract vendor, CC, GL, and dates from a context string."""
+        # Vendor: 10-digit number starting with 01
+        vendor = None
+        m_v = re.search(r'\b(01\d{8})\b', context)
+        if m_v:
+            vendor = m_v.group(1)
+
+        # GL: 6-digit account starting with 3 (300xxx)
+        gl = None
+        m_gl = re.search(r'\b(3\d{5})\b', context)
+        if m_gl:
+            gl = m_gl.group(1)
+
+        # Cost Centre: prefer known CC codes, else first 2-letter + 2-digit token
+        cc = None
+        for m_cc in re.finditer(r'\b([A-Z]{2}\d{2})\b', context):
+            val = m_cc.group(1).upper()
+            if val in known_ccs:
+                cc = val
+                break
+        if not cc:
+            m_cc2 = re.search(r'\b([A-Z]{2}\d{2})\b', context)
+            if m_cc2:
+                cc = m_cc2.group(1).upper()
+
+        # Dates
+        dates_found = []
+        for dp in _date_pats:
+            for dm in re.finditer(dp, context, re.IGNORECASE):
+                dates_found.append(dm.group(1))
+
+        inv_date = _parse_date_str(dates_found[0]) if dates_found else None
+        due_date = _parse_date_str(dates_found[-1]) if len(dates_found) >= 2 else None
+
+        return vendor, cc, gl, inv_date, due_date
+
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+
+        lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+        for i, line in enumerate(lines):
+            if "APINV" not in line.upper():
+                continue
+
+            # Invoice number (Reference): 7–10 digits immediately after APINV
+            m = re.search(r'APINV\s+(\d{7,10})\b', line, re.IGNORECASE)
+            if not m:
+                continue
+            invoice_no = m.group(1)
+
+            # Merge this line with the next 2 to capture multi-line Crystal Reports rows
+            context = " ".join(lines[i:min(i + 3, len(lines))])
+            vendor, cc, gl, inv_date, due_date = _extract_fields(context)
+
+            records[invoice_no] = {
+                "invoice_date": inv_date,
+                "due_date":     due_date,
+                "cc":           cc,
+                "vendor":       vendor,
+                "gl":           gl,
+            }
+
+    except Exception:
+        pass
+
+    return records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSS STYLES
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -856,11 +1020,12 @@ st.markdown("""
 <p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_split, tab_match, tab_cod, tab_couru, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_db, tab_cfg = st.tabs([
     "✂️  Invoice Splitter",
     "🔗  Invoice Matcher",
     "🏷️  Invoice Coding",
     "📊  Couru Code",
+    "🔍  AP Audit",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -1562,7 +1727,269 @@ with tab_couru:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — DATABASE
+# TAB 5 — AP AUDIT VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_audit:
+    st.subheader("🔍 AP Audit Validation")
+    st.markdown(
+        "Cross-reference invoice PDFs against the **A/P Voucher Audit Listing** "
+        "to verify invoice number, date, payment date, cost centre, vendor, and GL "
+        "before the session is permanently posted."
+    )
+
+    col_inv_up, col_rpt_up = st.columns(2)
+    with col_inv_up:
+        st.markdown("**📄 Invoice PDFs**")
+        audit_inv_files = st.file_uploader(
+            "Upload invoices",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="audit_inv_upload",
+            label_visibility="collapsed",
+        )
+        if audit_inv_files:
+            st.caption(f"{len(audit_inv_files)} invoice(s) loaded")
+
+    with col_rpt_up:
+        st.markdown("**📋 A/P Voucher Audit Listing (PDF)**")
+        audit_report_file = st.file_uploader(
+            "Upload audit report",
+            type=["pdf"],
+            accept_multiple_files=False,
+            key="audit_report_upload",
+            label_visibility="collapsed",
+        )
+        if audit_report_file:
+            st.caption(f"Report: **{audit_report_file.name}**")
+
+    col_run_a, col_clr_a, _ = st.columns([2, 2, 5])
+    with col_run_a:
+        run_audit = st.button(
+            "🔍 Run Validation",
+            type="primary",
+            use_container_width=True,
+            disabled=not (audit_inv_files and audit_report_file),
+        )
+    with col_clr_a:
+        if st.button("🗑️ Clear results", use_container_width=True, key="audit_clear"):
+            st.session_state["audit_results"]    = None
+            st.session_state["audit_data_count"] = 0
+            st.rerun()
+
+    if run_audit and audit_inv_files and audit_report_file:
+        audit_data = parse_audit_report(audit_report_file.read())
+        st.session_state["audit_data_count"] = len(audit_data)
+
+        if not audit_data:
+            st.warning(
+                "⚠️ No records could be parsed from the audit report PDF. "
+                "Please verify the file is the correct A/P Voucher Audit Listing."
+            )
+        else:
+            def _cmp(a, b):
+                if a is None or b is None:
+                    return None
+                if isinstance(a, date) and isinstance(b, date):
+                    return a == b
+                return str(a).strip().upper() == str(b).strip().upper()
+
+            val_results = []
+            prog = st.progress(0, text="Validating invoices…")
+            for fi, f in enumerate(audit_inv_files):
+                prog.progress((fi + 1) / len(audit_inv_files), text=f"Processing {f.name}…")
+                raw = f.read()
+
+                inv_data   = extract_invoice_data(raw, f.name)
+                invoice_no = inv_data.get("invoice_no")
+                inv_date   = extract_invoice_date(raw)
+                exp_due    = calc_due_date(inv_date)
+
+                cc_prefix = inv_data.get("cc_prefix")
+                if inv_data.get("is_six"):
+                    vendor_ext = VENDOR_EXCEPCION
+                    _, cc_ext  = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
+                else:
+                    vendor_ext, cc_ext = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
+                gl_ext = get_gl(inv_data.get("product_code"))
+
+                audit_rec       = audit_data.get(invoice_no) if invoice_no else None
+                inv_date_aud    = (audit_rec or {}).get("invoice_date")  # already a date | None
+                due_date_aud    = (audit_rec or {}).get("due_date")
+                cc_aud          = (audit_rec or {}).get("cc")
+                vendor_aud      = (audit_rec or {}).get("vendor")
+                gl_aud          = (audit_rec or {}).get("gl")
+
+                val_results.append({
+                    "filename":     f.name,
+                    "invoice_no":   invoice_no or "—",
+                    "found":        audit_rec is not None,
+                    # From invoice PDF
+                    "inv_date":     inv_date,
+                    "exp_due":      exp_due,
+                    "cc_ext":       cc_ext,
+                    "vendor_ext":   vendor_ext,
+                    "gl_ext":       gl_ext,
+                    # From audit report
+                    "inv_date_aud": inv_date_aud,
+                    "due_date_aud": due_date_aud,
+                    "cc_aud":       cc_aud,
+                    "vendor_aud":   vendor_aud,
+                    "gl_aud":       gl_aud,
+                    # Validation flags
+                    "inv_date_ok":  _cmp(inv_date, inv_date_aud),
+                    "due_date_ok":  _cmp(exp_due, due_date_aud),
+                    "cc_ok":        _cmp(cc_ext, cc_aud),
+                    "vendor_ok":    _cmp(vendor_ext, vendor_aud),
+                    "gl_ok":        _cmp(gl_ext, gl_aud),
+                })
+
+            prog.progress(1.0, text="✅ Validation complete")
+            st.session_state["audit_results"] = val_results
+            st.rerun()
+
+    # ── Results ────────────────────────────────────────────────────────────────
+    if st.session_state.get("audit_results"):
+        val_results  = st.session_state["audit_results"]
+        audit_count  = st.session_state.get("audit_data_count", 0)
+
+        def _icon(ok):
+            if ok is None: return "❓"
+            return "✅" if ok else "❌"
+
+        def _fmt_date(d):
+            return d.strftime("%d/%m/%Y") if d else "—"
+
+        n_found  = sum(1 for r in val_results if r["found"])
+        n_all_ok = sum(
+            1 for r in val_results
+            if r["found"] and all(
+                v is not False
+                for v in [r["inv_date_ok"], r["due_date_ok"],
+                          r["cc_ok"], r["vendor_ok"], r["gl_ok"]]
+            )
+        )
+        n_issues = len(val_results) - n_all_ok
+
+        st.info(f"Audit report: **{audit_count}** record(s) parsed")
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num blue'>{len(val_results)}</div>"
+                f"<div class='stat-lbl'>Invoices checked</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            col_c = "green" if n_found == len(val_results) else "amber"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_found}</div>"
+                f"<div class='stat-lbl'>Found in audit</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num green'>{n_all_ok}</div>"
+                f"<div class='stat-lbl'>All fields OK</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c4:
+            col_c = "red" if n_issues else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_issues}</div>"
+                f"<div class='stat-lbl'>Need review</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        for r in val_results:
+            all_ok = r["found"] and all(
+                v is not False
+                for v in [r["inv_date_ok"], r["due_date_ok"],
+                          r["cc_ok"], r["vendor_ok"], r["gl_ok"]]
+            )
+            top_icon = "✅" if all_ok else ("❌" if not r["found"] else "⚠️")
+
+            with st.expander(
+                f"{top_icon}  {r['filename']}  —  Invoice {r['invoice_no']}",
+                expanded=not all_ok,
+            ):
+                if not r["found"]:
+                    st.error(
+                        f"Invoice **{r['invoice_no']}** was not found in the audit report. "
+                        "Verify the invoice number or check if it has been entered."
+                    )
+                else:
+                    headers   = ["Invoice No",  "Invoice Date",   "Payment Date",  "Cost Centre", "Vendor",       "GL Account"]
+                    ok_flags  = [True,           r["inv_date_ok"], r["due_date_ok"], r["cc_ok"],   r["vendor_ok"], r["gl_ok"]]
+                    pdf_vals  = [
+                        r["invoice_no"],
+                        _fmt_date(r["inv_date"]),
+                        _fmt_date(r["exp_due"]),
+                        r["cc_ext"]     or "—",
+                        r["vendor_ext"] or "—",
+                        r["gl_ext"]     or "—",
+                    ]
+                    aud_vals  = [
+                        r["invoice_no"],
+                        _fmt_date(r["inv_date_aud"]),
+                        _fmt_date(r["due_date_aud"]),
+                        r["cc_aud"]     or "—",
+                        r["vendor_aud"] or "—",
+                        r["gl_aud"]     or "—",
+                    ]
+
+                    cols = st.columns(6)
+                    for col, hdr, ok, pv, av in zip(cols, headers, ok_flags, pdf_vals, aud_vals):
+                        colour = "#28a745" if ok else ("#dc3545" if ok is False else "#6c757d")
+                        col.markdown(f"**{hdr}**")
+                        col.markdown(
+                            f"<span style='font-size:20px;color:{colour}'>{_icon(ok)}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        col.caption(f"PDF: `{pv}`")
+                        col.caption(f"Audit: `{av}`")
+
+        # ── Export to Excel ────────────────────────────────────────────────────
+        st.divider()
+        export_rows = []
+        for r in val_results:
+            export_rows.append({
+                "File":               r["filename"],
+                "Invoice No":         r["invoice_no"],
+                "Found in Audit":     "Yes" if r["found"] else "No",
+                "Inv Date (PDF)":     _fmt_date(r["inv_date"]),
+                "Inv Date (Audit)":   _fmt_date(r["inv_date_aud"]),
+                "Inv Date OK":        _icon(r["inv_date_ok"]),
+                "Payment Date (Calc)":_fmt_date(r["exp_due"]),
+                "Payment Date (Audit)":_fmt_date(r["due_date_aud"]),
+                "Payment Date OK":    _icon(r["due_date_ok"]),
+                "CC (PDF)":           r["cc_ext"]     or "",
+                "CC (Audit)":         r["cc_aud"]     or "",
+                "CC OK":              _icon(r["cc_ok"]),
+                "Vendor (PDF)":       r["vendor_ext"] or "",
+                "Vendor (Audit)":     r["vendor_aud"] or "",
+                "Vendor OK":          _icon(r["vendor_ok"]),
+                "GL (PDF)":           r["gl_ext"]     or "",
+                "GL (Audit)":         r["gl_aud"]     or "",
+                "GL OK":              _icon(r["gl_ok"]),
+            })
+        df_exp = pd.DataFrame(export_rows)
+        buf_xl = BytesIO()
+        with pd.ExcelWriter(buf_xl, engine="openpyxl") as xl_writer:
+            df_exp.to_excel(xl_writer, index=False)
+        buf_xl.seek(0)
+        st.download_button(
+            "⬇️ Download Validation Report (Excel)",
+            data=buf_xl.read(),
+            file_name=f"ap_audit_validation_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_db:
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
@@ -1676,7 +2103,7 @@ with tab_db:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — SETTINGS
+# TAB 7 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cfg:
     st.subheader("General Settings")
