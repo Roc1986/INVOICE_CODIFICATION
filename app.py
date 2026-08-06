@@ -750,7 +750,9 @@ def _parse_date_str(s: str) -> "date | None":
         "%d-%b-%Y", "%d-%B-%Y",
         "%d-%b-%y", "%d-%B-%y",
         "%d/%m/%Y", "%m/%d/%Y",
+        "%d/%m/%y", "%m/%d/%y",
         "%Y-%m-%d", "%Y/%m/%d",
+        "%d.%m.%Y",
     ):
         try:
             return datetime.strptime(s, fmt).date()
@@ -809,57 +811,51 @@ def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
 def parse_audit_report(pdf_bytes: bytes) -> dict:
     """
     Parse the A/P Voucher Audit Listing PDF (Crystal Reports format).
-    Returns a dict keyed by invoice_no (Reference field):
-      { "invoice_date": date|None, "due_date": date|None,
-        "cc": str|None, "vendor": str|None, "gl": str|None }
+    Returns a dict keyed by invoice_no:
+      { invoice_date, due_date, cc, vendor, gl, net, total }
+    Quincena heuristic: a date with day == 15 or 30 is the due date, not the invoice date.
     """
     records = {}
     known_ccs = {r["cc"].upper() for r in st.session_state.proveedores}
 
-    # Date patterns found in Crystal Reports PDFs
     _date_pats = [
         r'\b(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4})\b',
         r'\b(\d{2}/\d{2}/\d{4})\b',
+        r'\b(\d{1,2}/\d{1,2}/\d{2})\b',
         r'\b(\d{4}-\d{2}-\d{2})\b',
+        r'\b(\d{2}\.\d{2}\.\d{4})\b',
         r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})\b',
     ]
 
-    def _extract_fields(context: str):
-        """Extract vendor, CC, GL, and dates from a context string."""
-        # Vendor: 10-digit number starting with 01
-        vendor = None
-        m_v = re.search(r'\b(01\d{8})\b', context)
-        if m_v:
-            vendor = m_v.group(1)
-
-        # GL: 6-digit account starting with 3 (300xxx)
-        gl = None
-        m_gl = re.search(r'\b(3\d{5})\b', context)
-        if m_gl:
-            gl = m_gl.group(1)
-
-        # Cost Centre: prefer known CC codes, else first 2-letter + 2-digit token
-        cc = None
-        for m_cc in re.finditer(r'\b([A-Z]{2}\d{2})\b', context):
-            val = m_cc.group(1).upper()
-            if val in known_ccs:
-                cc = val
-                break
-        if not cc:
-            m_cc2 = re.search(r'\b([A-Z]{2}\d{2})\b', context)
-            if m_cc2:
-                cc = m_cc2.group(1).upper()
-
-        # Dates
-        dates_found = []
+    def _collect_dates(text: str) -> list:
+        seen, result = set(), []
         for dp in _date_pats:
-            for dm in re.finditer(dp, context, re.IGNORECASE):
-                dates_found.append(dm.group(1))
+            for m in re.finditer(dp, text, re.IGNORECASE):
+                d = _parse_date_str(m.group(1))
+                if d and d not in seen:
+                    seen.add(d)
+                    result.append(d)
+        return result
 
-        inv_date = _parse_date_str(dates_found[0]) if dates_found else None
-        due_date = _parse_date_str(dates_found[-1]) if len(dates_found) >= 2 else None
-
-        return vendor, cc, gl, inv_date, due_date
+    def _assign_dates(dates: list):
+        """
+        Quincena heuristic: day 15 or 30 → due date.
+        If only quincena-day dates found, use order (first=invoice, last=due).
+        """
+        inv_date = due_date = None
+        for d in dates:
+            if d.day in (15, 30):
+                if due_date is None:
+                    due_date = d
+            else:
+                if inv_date is None:
+                    inv_date = d
+        # Fallback when all dates are quincena-day
+        if inv_date is None and len(dates) >= 2:
+            inv_date, due_date = dates[0], dates[-1]
+        elif inv_date is None and len(dates) == 1:
+            due_date = dates[0]
+        return inv_date, due_date
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
@@ -873,15 +869,43 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             if "APINV" not in line.upper():
                 continue
 
-            # Invoice number (Reference): 7–10 digits immediately after APINV
             m = re.search(r'APINV\s+(\d{7,10})\b', line, re.IGNORECASE)
             if not m:
                 continue
             invoice_no = m.group(1)
 
-            # Merge this line with the next 2 to capture multi-line Crystal Reports rows
-            context = " ".join(lines[i:min(i + 3, len(lines))])
-            vendor, cc, gl, inv_date, due_date = _extract_fields(context)
+            # Wide context: 2 lines before + 6 lines after (covers multi-line CR rows)
+            ctx_lines = lines[max(0, i - 2): min(len(lines), i + 7)]
+            context = " ".join(ctx_lines)
+
+            # Vendor: 10 digits starting with 01
+            vendor = None
+            mv = re.search(r'\b(01\d{8})\b', context)
+            if mv:
+                vendor = mv.group(1)
+
+            # GL: 6 digits starting with 3
+            gl = None
+            mg = re.search(r'\b(3\d{5})\b', context)
+            if mg:
+                gl = mg.group(1)
+
+            # CC: prefer known values
+            cc = None
+            for mc in re.finditer(r'\b([A-Z]{2}\d{2})\b', context):
+                if mc.group(1).upper() in known_ccs:
+                    cc = mc.group(1).upper()
+                    break
+
+            # Dates with quincena heuristic
+            all_dates = _collect_dates(context)
+            inv_date, due_date = _assign_dates(all_dates)
+
+            # Monetary amounts: collect unique values, sorted ascending
+            raw_amounts = re.findall(r'\b([\d,]+\.\d{2})\b', context)
+            amounts_num = sorted({float(a.replace(",", "")) for a in raw_amounts})
+            net_amt   = amounts_num[0]  if amounts_num else None
+            total_amt = amounts_num[-1] if amounts_num else None
 
             records[invoice_no] = {
                 "invoice_date": inv_date,
@@ -889,12 +913,59 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 "cc":           cc,
                 "vendor":       vendor,
                 "gl":           gl,
+                "net":          net_amt,
+                "total":        total_amt,
             }
 
     except Exception:
         pass
 
     return records
+
+
+def extract_invoice_amounts(pdf_bytes: bytes) -> dict:
+    """
+    Extract net (subtotal), combined taxes, and total from an Atlantic invoice PDF.
+    Returns { "net": str|None, "taxes": float|None, "total": str|None }
+    """
+    result = {"net": None, "taxes": None, "total": None}
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+        lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+        taxes_acc = None
+        last_total = None
+
+        for line in lines:
+            upper = line.upper()
+            amounts = re.findall(r'([\d,]+\.\d{2})', line)
+            if not amounts:
+                continue
+            val = amounts[0].replace(",", "")
+
+            if re.search(r'\bSUB\s*TOTAL\b|\bSOUS.?TOTAL\b', upper):
+                result["net"] = val
+
+            elif re.search(r'\bGST\b|\bTPS\b|G\.S\.T|T\.P\.S', upper):
+                taxes_acc = (taxes_acc or 0.0) + float(val)
+
+            elif re.search(r'\bQST\b|\bTVQ\b|Q\.S\.T|T\.V\.Q', upper):
+                taxes_acc = (taxes_acc or 0.0) + float(val)
+
+            elif re.search(r'^\s*TOTAL\b', upper):
+                last_total = val
+
+        if taxes_acc is not None:
+            result["taxes"] = round(taxes_acc, 2)
+        if last_total:
+            result["total"] = last_total
+
+    except Exception:
+        pass
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1793,6 +1864,15 @@ with tab_audit:
                     return a == b
                 return str(a).strip().upper() == str(b).strip().upper()
 
+            def _cmp_amt(a, b, tol=0.05):
+                """Compare two floats with tolerance; None on either side → None."""
+                if a is None or b is None:
+                    return None
+                try:
+                    return abs(float(a) - float(b)) <= tol
+                except (TypeError, ValueError):
+                    return None
+
             val_results = []
             prog = st.progress(0, text="Validating invoices…")
             for fi, f in enumerate(audit_inv_files):
@@ -1804,6 +1884,15 @@ with tab_audit:
                 inv_date   = extract_invoice_date(raw)
                 exp_due    = calc_due_date(inv_date)
 
+                # Amounts from invoice PDF
+                amts = extract_invoice_amounts(raw)
+                inv_net   = float(amts["net"])   if amts["net"]   else None
+                inv_taxes = amts["taxes"]  # already float or None
+                inv_total = float(amts["total"]) if amts["total"] else None
+                # If total not found, compute it
+                if inv_total is None and inv_net is not None and inv_taxes is not None:
+                    inv_total = round(inv_net + inv_taxes, 2)
+
                 cc_prefix = inv_data.get("cc_prefix")
                 if inv_data.get("is_six"):
                     vendor_ext = VENDOR_EXCEPCION
@@ -1812,12 +1901,19 @@ with tab_audit:
                     vendor_ext, cc_ext = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
                 gl_ext = get_gl(inv_data.get("product_code"))
 
-                audit_rec       = audit_data.get(invoice_no) if invoice_no else None
-                inv_date_aud    = (audit_rec or {}).get("invoice_date")  # already a date | None
-                due_date_aud    = (audit_rec or {}).get("due_date")
-                cc_aud          = (audit_rec or {}).get("cc")
-                vendor_aud      = (audit_rec or {}).get("vendor")
-                gl_aud          = (audit_rec or {}).get("gl")
+                audit_rec    = audit_data.get(invoice_no) if invoice_no else None
+                aud          = audit_rec or {}
+                inv_date_aud = aud.get("invoice_date")
+                due_date_aud = aud.get("due_date")
+                cc_aud       = aud.get("cc")
+                vendor_aud   = aud.get("vendor")
+                gl_aud       = aud.get("gl")
+                aud_net      = aud.get("net")    # float or None
+                aud_total    = aud.get("total")  # float or None
+
+                # Amount comparison: try total first, then net
+                net_ok   = _cmp_amt(inv_net,   aud_net)
+                total_ok = _cmp_amt(inv_total, aud_total)
 
                 val_results.append({
                     "filename":     f.name,
@@ -1829,18 +1925,25 @@ with tab_audit:
                     "cc_ext":       cc_ext,
                     "vendor_ext":   vendor_ext,
                     "gl_ext":       gl_ext,
+                    "inv_net":      inv_net,
+                    "inv_taxes":    inv_taxes,
+                    "inv_total":    inv_total,
                     # From audit report
                     "inv_date_aud": inv_date_aud,
                     "due_date_aud": due_date_aud,
                     "cc_aud":       cc_aud,
                     "vendor_aud":   vendor_aud,
                     "gl_aud":       gl_aud,
+                    "aud_net":      aud_net,
+                    "aud_total":    aud_total,
                     # Validation flags
                     "inv_date_ok":  _cmp(inv_date, inv_date_aud),
                     "due_date_ok":  _cmp(exp_due, due_date_aud),
                     "cc_ok":        _cmp(cc_ext, cc_aud),
                     "vendor_ok":    _cmp(vendor_ext, vendor_aud),
                     "gl_ok":        _cmp(gl_ext, gl_aud),
+                    "net_ok":       net_ok,
+                    "total_ok":     total_ok,
                 })
 
             prog.progress(1.0, text="✅ Validation complete")
@@ -1859,14 +1962,16 @@ with tab_audit:
         def _fmt_date(d):
             return d.strftime("%d/%m/%Y") if d else "—"
 
+        def _fmt_amt(v):
+            if v is None: return "—"
+            return f"{float(v):,.2f}"
+
+        _all_flags = ["inv_date_ok", "due_date_ok", "cc_ok", "vendor_ok", "gl_ok", "net_ok", "total_ok"]
+
         n_found  = sum(1 for r in val_results if r["found"])
         n_all_ok = sum(
             1 for r in val_results
-            if r["found"] and all(
-                v is not False
-                for v in [r["inv_date_ok"], r["due_date_ok"],
-                          r["cc_ok"], r["vendor_ok"], r["gl_ok"]]
-            )
+            if r["found"] and all(v is not False for v in [r[k] for k in _all_flags])
         )
         n_issues = len(val_results) - n_all_ok
 
@@ -1904,11 +2009,7 @@ with tab_audit:
         st.markdown("<br>", unsafe_allow_html=True)
 
         for r in val_results:
-            all_ok = r["found"] and all(
-                v is not False
-                for v in [r["inv_date_ok"], r["due_date_ok"],
-                          r["cc_ok"], r["vendor_ok"], r["gl_ok"]]
-            )
+            all_ok = r["found"] and all(v is not False for v in [r[k] for k in _all_flags])
             top_icon = "✅" if all_ok else ("❌" if not r["found"] else "⚠️")
 
             with st.expander(
@@ -1921,9 +2022,10 @@ with tab_audit:
                         "Verify the invoice number or check if it has been entered."
                     )
                 else:
-                    headers   = ["Invoice No",  "Invoice Date",   "Payment Date",  "Cost Centre", "Vendor",       "GL Account"]
-                    ok_flags  = [True,           r["inv_date_ok"], r["due_date_ok"], r["cc_ok"],   r["vendor_ok"], r["gl_ok"]]
-                    pdf_vals  = [
+                    # ── Row 1: Invoice / Date / CC / Vendor / GL ───────────────
+                    headers1  = ["Invoice No",   "Invoice Date",    "Payment Date",    "Cost Centre",  "Vendor",        "GL Account"]
+                    ok_flags1 = [True,            r["inv_date_ok"],  r["due_date_ok"],  r["cc_ok"],     r["vendor_ok"],  r["gl_ok"]]
+                    pdf_vals1 = [
                         r["invoice_no"],
                         _fmt_date(r["inv_date"]),
                         _fmt_date(r["exp_due"]),
@@ -1931,7 +2033,7 @@ with tab_audit:
                         r["vendor_ext"] or "—",
                         r["gl_ext"]     or "—",
                     ]
-                    aud_vals  = [
+                    aud_vals1 = [
                         r["invoice_no"],
                         _fmt_date(r["inv_date_aud"]),
                         _fmt_date(r["due_date_aud"]),
@@ -1939,41 +2041,82 @@ with tab_audit:
                         r["vendor_aud"] or "—",
                         r["gl_aud"]     or "—",
                     ]
-
-                    cols = st.columns(6)
-                    for col, hdr, ok, pv, av in zip(cols, headers, ok_flags, pdf_vals, aud_vals):
-                        colour = "#28a745" if ok else ("#dc3545" if ok is False else "#6c757d")
+                    cols1 = st.columns(6)
+                    for col, hdr, ok, pv, av in zip(cols1, headers1, ok_flags1, pdf_vals1, aud_vals1):
+                        clr = "#28a745" if ok else ("#dc3545" if ok is False else "#6c757d")
                         col.markdown(f"**{hdr}**")
-                        col.markdown(
-                            f"<span style='font-size:20px;color:{colour}'>{_icon(ok)}</span>",
-                            unsafe_allow_html=True,
-                        )
+                        col.markdown(f"<span style='font-size:20px;color:{clr}'>{_icon(ok)}</span>",
+                                     unsafe_allow_html=True)
                         col.caption(f"PDF: `{pv}`")
                         col.caption(f"Audit: `{av}`")
+
+                    # ── Row 2: Amounts ─────────────────────────────────────────
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("**💰 Amounts**")
+                    a1, a2, a3, a4, a5 = st.columns(5)
+
+                    # Net (subtotal)
+                    with a1:
+                        st.markdown("**Net (subtotal)**")
+                        st.markdown(f"<span style='font-size:20px;color:{'#28a745' if r['net_ok'] else ('#dc3545' if r['net_ok'] is False else '#6c757d')}'>{_icon(r['net_ok'])}</span>",
+                                    unsafe_allow_html=True)
+                        st.caption(f"PDF: `{_fmt_amt(r['inv_net'])}`")
+                        st.caption(f"Audit: `{_fmt_amt(r['aud_net'])}`")
+
+                    # Taxes
+                    with a2:
+                        st.markdown("**Taxes (GST+QST)**")
+                        st.markdown("<span style='font-size:20px;color:#6c757d'>❓</span>",
+                                    unsafe_allow_html=True)
+                        st.caption(f"PDF: `{_fmt_amt(r['inv_taxes'])}`")
+                        st.caption("Audit: `—`")
+
+                    # Total
+                    with a3:
+                        st.markdown("**Total**")
+                        st.markdown(f"<span style='font-size:20px;color:{'#28a745' if r['total_ok'] else ('#dc3545' if r['total_ok'] is False else '#6c757d')}'>{_icon(r['total_ok'])}</span>",
+                                    unsafe_allow_html=True)
+                        st.caption(f"PDF: `{_fmt_amt(r['inv_total'])}`")
+                        st.caption(f"Audit: `{_fmt_amt(r['aud_total'])}`")
+
+                    with a4:
+                        st.markdown("**Audit Net**")
+                        st.caption(f"`{_fmt_amt(r['aud_net'])}`")
+
+                    with a5:
+                        st.markdown("**Audit Total**")
+                        st.caption(f"`{_fmt_amt(r['aud_total'])}`")
 
         # ── Export to Excel ────────────────────────────────────────────────────
         st.divider()
         export_rows = []
         for r in val_results:
             export_rows.append({
-                "File":               r["filename"],
-                "Invoice No":         r["invoice_no"],
-                "Found in Audit":     "Yes" if r["found"] else "No",
-                "Inv Date (PDF)":     _fmt_date(r["inv_date"]),
-                "Inv Date (Audit)":   _fmt_date(r["inv_date_aud"]),
-                "Inv Date OK":        _icon(r["inv_date_ok"]),
-                "Payment Date (Calc)":_fmt_date(r["exp_due"]),
-                "Payment Date (Audit)":_fmt_date(r["due_date_aud"]),
-                "Payment Date OK":    _icon(r["due_date_ok"]),
-                "CC (PDF)":           r["cc_ext"]     or "",
-                "CC (Audit)":         r["cc_aud"]     or "",
-                "CC OK":              _icon(r["cc_ok"]),
-                "Vendor (PDF)":       r["vendor_ext"] or "",
-                "Vendor (Audit)":     r["vendor_aud"] or "",
-                "Vendor OK":          _icon(r["vendor_ok"]),
-                "GL (PDF)":           r["gl_ext"]     or "",
-                "GL (Audit)":         r["gl_aud"]     or "",
-                "GL OK":              _icon(r["gl_ok"]),
+                "File":                  r["filename"],
+                "Invoice No":            r["invoice_no"],
+                "Found in Audit":        "Yes" if r["found"] else "No",
+                "Inv Date (PDF)":        _fmt_date(r["inv_date"]),
+                "Inv Date (Audit)":      _fmt_date(r["inv_date_aud"]),
+                "Inv Date OK":           _icon(r["inv_date_ok"]),
+                "Payment Date (Calc)":   _fmt_date(r["exp_due"]),
+                "Payment Date (Audit)":  _fmt_date(r["due_date_aud"]),
+                "Payment Date OK":       _icon(r["due_date_ok"]),
+                "CC (PDF)":              r["cc_ext"]    or "",
+                "CC (Audit)":            r["cc_aud"]    or "",
+                "CC OK":                 _icon(r["cc_ok"]),
+                "Vendor (PDF)":          r["vendor_ext"] or "",
+                "Vendor (Audit)":        r["vendor_aud"] or "",
+                "Vendor OK":             _icon(r["vendor_ok"]),
+                "GL (PDF)":              r["gl_ext"]    or "",
+                "GL (Audit)":            r["gl_aud"]    or "",
+                "GL OK":                 _icon(r["gl_ok"]),
+                "Net (PDF)":             _fmt_amt(r["inv_net"]),
+                "Taxes (PDF)":           _fmt_amt(r["inv_taxes"]),
+                "Total (PDF)":           _fmt_amt(r["inv_total"]),
+                "Net (Audit)":           _fmt_amt(r["aud_net"]),
+                "Total (Audit)":         _fmt_amt(r["aud_total"]),
+                "Net OK":                _icon(r["net_ok"]),
+                "Total OK":              _icon(r["total_ok"]),
             })
         df_exp = pd.DataFrame(export_rows)
         buf_xl = BytesIO()
