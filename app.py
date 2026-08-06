@@ -810,106 +810,61 @@ def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
 
 def parse_audit_report(pdf_bytes: bytes) -> dict:
     """
-    Parse the A/P Voucher Audit Listing PDF (Crystal Reports format) using
-    spatial word positions from pdfplumber.extract_words().
+    Parse the A/P Voucher Audit Listing PDF (Crystal Reports format).
 
-    Crystal Reports outputs text COLUMN by column, so pdfplumber's plain
-    extract_text() places dates far from the APINV line in the text stream.
-    By working with (word, x0, top) coordinates we can:
-      1. Locate the 'Invoice Date' column header → determine its x-range.
-      2. For each APINV data row, collect words in that x-range at the same
-         y-band → those are the dates for that invoice.
-      3. The first date (smallest top) = invoice date; second = due date.
+    Uses pdfplumber.extract_words() for spatial parsing.  Each invoice block
+    is bounded by [APINV_row_y, next_APINV_row_y) so fields from adjacent
+    invoices never cross-contaminate.
 
-    Returns a dict keyed by invoice_no:
-      { invoice_date, due_date, cc, vendor, gl, total }
+    Date search is limited to the first ~35 pts of each block (the APINV row
+    plus the immediately following 'due date' row) to avoid picking up page
+    footer dates.  Total is located by finding the 'Total:' label row.
     """
     records = {}
     known_ccs = {r["cc"].upper() for r in st.session_state.proveedores}
 
-    _date_pats = [
-        r'^(\d{4}-\d{2}-\d{2})$',                                         # ISO: 2026-08-05
-        r'^(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4})$',  # DD-Mon-YY
-        r'^(\d{2}/\d{2}/\d{4})$',                                         # DD/MM/YYYY
-        r'^(\d{4}/\d{2}/\d{2})$',                                         # YYYY/MM/DD
-        r'^(\d{2}\.\d{2}\.\d{4})$',                                       # DD.MM.YYYY
+    _ISO_PAT   = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+    _OTHER_PATS = [
+        re.compile(r'^\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4}$', re.I),
+        re.compile(r'^\d{2}/\d{2}/\d{4}$'),
+        re.compile(r'^\d{4}/\d{2}/\d{2}$'),
+        re.compile(r'^\d{2}\.\d{2}\.\d{4}$'),
     ]
 
     def _is_date_word(text: str) -> "date | None":
-        """Return parsed date if the word looks like a standalone date string."""
         t = text.strip()
-        for dp in _date_pats:
-            if re.match(dp, t, re.IGNORECASE):
-                d = _parse_date_str(t)
-                if d:
-                    return d
+        if _ISO_PAT.match(t):
+            return _parse_date_str(t)
+        for p in _OTHER_PATS:
+            if p.match(t):
+                return _parse_date_str(t)
         return None
 
-    def _assign_dates(dates_by_y: list):
-        """
-        dates_by_y: list of (top_y, date) sorted by top_y ascending.
-        First entry = invoice date, second = due date.
-        Apply quincena heuristic as a sanity check.
-        """
-        if not dates_by_y:
+    def _assign_dates(date_items: list):
+        """date_items: [(top_y, date)]. First by y = invoice date, second = due date."""
+        if not date_items:
             return None, None
-        dates_by_y.sort(key=lambda x: x[0])
-        dates = [d for _, d in dates_by_y]
+        date_items.sort(key=lambda x: x[0])
+        dates = [d for _, d in date_items]
         if len(dates) == 1:
             d = dates[0]
-            if d.day in (15, 30):
-                return None, d
-            return d, None
-        # Two dates: first = invoice, second = due
-        inv_date, due_date = dates[0], dates[1]
-        # Sanity-swap if heuristic disagrees
-        if inv_date.day in (15, 30) and due_date.day not in (15, 30):
-            inv_date, due_date = due_date, inv_date
-        return inv_date, due_date
+            return (None, d) if d.day in (15, 30) else (d, None)
+        inv, due = dates[0], dates[1]
+        if inv.day in (15, 30) and due.day not in (15, 30):
+            inv, due = due, inv
+        return inv, due
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 words = page.extract_words(
-                    x_tolerance=3,
-                    y_tolerance=3,
-                    keep_blank_chars=False,
-                    use_text_flow=False,
+                    x_tolerance=3, y_tolerance=3,
+                    keep_blank_chars=False, use_text_flow=False,
                 )
                 if not words:
                     continue
 
-                # ── Step 1: find the x-range of the "Invoice Date" column ────────
-                # Look for a word "Invoice" or "Date" near the column header area.
-                # The header row words have small top values (near top of page).
-                # Strategy: find any word containing "Date" that is also near a
-                # word containing "Invoice" on the same y-line, and record its x0..x1.
-                date_col_x0 = None
-                date_col_x1 = None
-
-                # Group header-area words by approximate y (top 15% of page height)
-                page_h = page.height
-                header_words = [w for w in words if w["top"] < page_h * 0.15]
-                # Collect y-bands in header
-                hdr_rows: dict = {}
-                for w in header_words:
-                    yk = round(w["top"] / 5) * 5
-                    hdr_rows.setdefault(yk, []).append(w)
-
-                for yk, row_words in hdr_rows.items():
-                    texts = [w["text"].upper() for w in row_words]
-                    if any("DATE" in t for t in texts):
-                        # Find the "DATE" word's x-position
-                        for w in row_words:
-                            if "DATE" in w["text"].upper():
-                                # Use a generous x-range around this word
-                                date_col_x0 = w["x0"] - 10
-                                date_col_x1 = w["x1"] + 60
-                                break
-                    if date_col_x0 is not None:
-                        break
-
-                # ── Step 2: group all page words by y-band (row) ─────────────────
+                # Group words into y-rows (4 pt tolerance)
                 row_map: dict = {}
                 for w in words:
                     yk = round(w["top"] / 4) * 4
@@ -917,90 +872,92 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
 
                 sorted_ys = sorted(row_map.keys())
 
-                # ── Step 3: find APINV rows and extract fields ───────────────────
+                # ── Pass 1: collect all APINV rows in order ──────────────────────
+                apinv_rows = []  # [(yk, invoice_no)]
                 for yk in sorted_ys:
-                    row_words = row_map[yk]
-                    row_texts = " ".join(w["text"] for w in row_words)
-
-                    if "APINV" not in row_texts.upper():
+                    row_ws  = row_map[yk]
+                    row_tx  = " ".join(w["text"] for w in row_ws)
+                    if "APINV" not in row_tx.upper():
                         continue
-
-                    # Extract invoice number (digits after APINV)
-                    m = re.search(r'APINV\s+(\d{7,10})\b', row_texts, re.IGNORECASE)
-                    if not m:
-                        # Try adjacent words
-                        apinv_idx = next(
-                            (i for i, w in enumerate(row_words)
-                             if "APINV" in w["text"].upper()), None
-                        )
-                        if apinv_idx is not None and apinv_idx + 1 < len(row_words):
-                            nxt = row_words[apinv_idx + 1]["text"]
+                    m = re.search(r'APINV\s+(\d{7,10})\b', row_tx, re.IGNORECASE)
+                    if m:
+                        apinv_rows.append((yk, m.group(1)))
+                        continue
+                    # Adjacent-word fallback
+                    for i, w in enumerate(row_ws):
+                        if "APINV" in w["text"].upper() and i + 1 < len(row_ws):
+                            nxt = row_ws[i + 1]["text"]
                             if re.match(r'^\d{7,10}$', nxt):
-                                invoice_no = nxt
-                            else:
-                                continue
-                        else:
-                            continue
-                    else:
-                        invoice_no = m.group(1)
+                                apinv_rows.append((yk, nxt))
+                                break
 
-                    # Collect a band of rows around this y: ±30 pts
-                    band_ys = [y for y in sorted_ys if abs(y - yk) <= 30]
-                    band_words = [w for y in band_ys for w in row_map[y]]
-                    band_text  = " ".join(w["text"] for w in band_words)
+                # ── Pass 2: extract fields from each bounded block ───────────────
+                for idx, (yk, invoice_no) in enumerate(apinv_rows):
+                    next_yk = (apinv_rows[idx + 1][0]
+                               if idx + 1 < len(apinv_rows)
+                               else max(sorted_ys) + 200)
+
+                    # Full block: [yk, next_yk)
+                    block_ys    = [y for y in sorted_ys if yk <= y < next_yk]
+                    block_words = [w for y in block_ys for w in row_map[y]]
+                    block_text  = " ".join(w["text"] for w in block_words)
 
                     # Vendor: 10 digits starting with 01
                     vendor = None
-                    mv = re.search(r'\b(01\d{8})\b', band_text)
+                    mv = re.search(r'\b(01\d{8})\b', block_text)
                     if mv:
                         vendor = mv.group(1)
 
                     # GL: 6 digits starting with 3
                     gl = None
-                    mg = re.search(r'\b(3\d{5})\b', band_text)
+                    mg = re.search(r'\b(3\d{5})\b', block_text)
                     if mg:
                         gl = mg.group(1)
 
                     # CC: known values only
                     cc = None
-                    for mc in re.finditer(r'\b([A-Z]{2}\d{2})\b', band_text):
+                    for mc in re.finditer(r'\b([A-Z]{2}\d{2})\b', block_text):
                         if mc.group(1).upper() in known_ccs:
                             cc = mc.group(1).upper()
                             break
 
-                    # ── Dates: spatial approach ──────────────────────────────────
-                    # Extend the band downward to catch sub-rows (+60 pts)
-                    date_band_ys = [y for y in sorted_ys if yk <= y <= yk + 60]
-                    dates_by_y = []
-                    if date_col_x0 is not None:
-                        # Look only in the date column x-range
-                        for y in date_band_ys:
-                            for w in row_map[y]:
-                                if date_col_x0 <= w["x0"] <= date_col_x1:
-                                    d = _is_date_word(w["text"])
-                                    if d:
-                                        dates_by_y.append((w["top"], d))
-                    else:
-                        # Fallback: any date-shaped word in the band
-                        for y in date_band_ys:
-                            for w in row_map[y]:
-                                d = _is_date_word(w["text"])
-                                if d:
-                                    dates_by_y.append((w["top"], d))
+                    # ── Dates: narrow top-band (APINV row + due-date row only) ───
+                    # Limit to yk..yk+35 so Crystal Reports footer dates are excluded
+                    date_band_ys = [y for y in block_ys if y <= yk + 35]
+                    date_items   = []
+                    for y in date_band_ys:
+                        for w in row_map[y]:
+                            d = _is_date_word(w["text"])
+                            if d:
+                                date_items.append((w["top"], d))
+                    inv_date, due_date = _assign_dates(date_items)
 
-                    inv_date, due_date = _assign_dates(dates_by_y)
+                    # ── Total: locate the 'Total:' label row in the block ────────
+                    total_amt = None
+                    for y in block_ys:
+                        row_ws = row_map[y]
+                        row_tx = " ".join(w["text"] for w in row_ws).upper()
+                        if (re.search(r'\bTOTAL\b', row_tx)
+                                and "SUB" not in row_tx
+                                and "SOUS" not in row_tx):
+                            for w in row_ws:
+                                clean = w["text"].replace(",", "")
+                                if re.match(r'^\d+\.\d{2}$', clean):
+                                    val = float(clean)
+                                    if val >= 10.0:
+                                        total_amt = val
+                                        break
+                            if total_amt is not None:
+                                break
 
-                    # ── Amounts: from sub-rows below APINV row ───────────────────
-                    # Sub-rows contain "Net Amount:", "GST:", "QST:" etc.
-                    sub_band_ys = [y for y in sorted_ys if yk < y <= yk + 80]
-                    sub_words   = [w for y in sub_band_ys for w in row_map[y]]
-                    sub_text    = " ".join(w["text"] for w in sub_words)
-                    raw_amounts = re.findall(r'\b([\d,]+\.\d{2})\b', sub_text)
-                    amounts_num = sorted({
-                        float(a.replace(",", "")) for a in raw_amounts
-                        if float(a.replace(",", "")) >= 10.0
-                    })
-                    total_amt = amounts_num[-1] if amounts_num else None
+                    # Fallback: largest amount ≥ 10 in the block
+                    if total_amt is None:
+                        raw_amounts = re.findall(r'\b([\d,]+\.\d{2})\b', block_text)
+                        amounts_num = sorted({
+                            float(a.replace(",", "")) for a in raw_amounts
+                            if float(a.replace(",", "")) >= 10.0
+                        })
+                        total_amt = amounts_num[-1] if amounts_num else None
 
                     records[invoice_no] = {
                         "invoice_date": inv_date,
