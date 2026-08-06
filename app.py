@@ -2088,7 +2088,23 @@ with tab_audit:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        for r in val_results:
+        # Filter toggle — default: show only invoices that need attention
+        show_all = st.toggle(
+            f"Show all {len(val_results)} invoices",
+            value=False,
+            help="By default only invoices with at least one issue are shown.",
+        )
+
+        needs_review = [
+            r for r in val_results
+            if not (r["found"] and all(v is not False for v in [r[k] for k in _all_flags]))
+        ]
+        display_list = val_results if show_all else needs_review
+
+        if not display_list:
+            st.success("✅ All invoices passed validation — nothing to review.")
+
+        for r in display_list:
             all_ok = r["found"] and all(v is not False for v in [r[k] for k in _all_flags])
             top_icon = "✅" if all_ok else ("❌" if not r["found"] else "⚠️")
 
