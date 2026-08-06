@@ -2086,89 +2086,10 @@ with tab_audit:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # Filter toggle — default: show only invoices that need attention
-        show_all = st.toggle(
-            f"Show all {len(val_results)} invoices",
-            value=False,
-            help="By default only invoices with at least one issue are shown.",
-        )
-
-        needs_review = [
-            r for r in val_results
-            if not (r["found"] and all(v is not False for v in [r[k] for k in _all_flags]))
-        ]
-        display_list = val_results if show_all else needs_review
-
-        if not display_list:
-            st.success("✅ All invoices passed validation — nothing to review.")
-
-        for r in display_list:
-            all_ok = r["found"] and all(v is not False for v in [r[k] for k in _all_flags])
-            top_icon = "✅" if all_ok else ("❌" if not r["found"] else "⚠️")
-
-            with st.expander(
-                f"{top_icon}  {r['filename']}  —  Invoice {r['invoice_no']}",
-                expanded=not all_ok,
-            ):
-                if not r["found"]:
-                    st.error(
-                        f"Invoice **{r['invoice_no']}** was not found in the audit report. "
-                        "Verify the invoice number or check if it has been entered."
-                    )
-                else:
-                    # ── Row 1: Invoice / Date / CC / Vendor / GL ───────────────
-                    headers1  = ["Invoice No",   "Invoice Date",    "Payment Date",    "Cost Centre",  "Vendor",        "GL Account"]
-                    ok_flags1 = [True,            r["inv_date_ok"],  r["due_date_ok"],  r["cc_ok"],     r["vendor_ok"],  r["gl_ok"]]
-                    pdf_vals1 = [
-                        r["invoice_no"],
-                        _fmt_date(r["inv_date"]),
-                        _fmt_date(r["exp_due"]),
-                        r["cc_ext"]     or "—",
-                        r["vendor_ext"] or "—",
-                        r["gl_ext"]     or "—",
-                    ]
-                    aud_vals1 = [
-                        r["invoice_no"],
-                        _fmt_date(r["inv_date_aud"]),
-                        _fmt_date(r["due_date_aud"]),
-                        r["cc_aud"]     or "—",
-                        r["vendor_aud"] or "—",
-                        r["gl_aud"]     or "—",
-                    ]
-                    cols1 = st.columns(6)
-                    for col, hdr, ok, pv, av in zip(cols1, headers1, ok_flags1, pdf_vals1, aud_vals1):
-                        clr = "#28a745" if ok else ("#dc3545" if ok is False else "#6c757d")
-                        col.markdown(f"**{hdr}**")
-                        col.markdown(f"<span style='font-size:20px;color:{clr}'>{_icon(ok)}</span>",
-                                     unsafe_allow_html=True)
-                        col.caption(f"PDF: `{pv}`")
-                        col.caption(f"Audit: `{av}`")
-
-                    # ── Row 2: Amounts ─────────────────────────────────────────
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.markdown("**💰 Amounts (CAD)**")
-                    a1, a2, a3, _ = st.columns([2, 2, 2, 3])
-
-                    with a1:
-                        st.markdown("**Net (subtotal)**")
-                        st.caption(f"PDF: `{_fmt_amt(r['inv_net'])}`")
-
-                    with a2:
-                        st.markdown("**Taxes (GST+QST)**")
-                        st.caption(f"PDF: `{_fmt_amt(r['inv_taxes'])}`")
-
-                    with a3:
-                        tok = r["total_ok"]
-                        clr = "#28a745" if tok else ("#dc3545" if tok is False else "#6c757d")
-                        st.markdown("**Total**")
-                        st.markdown(
-                            f"<span style='font-size:20px;color:{clr}'>{_icon(tok)}</span>",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(f"PDF: `{_fmt_amt(r['inv_total'])}`")
-                        st.caption(f"Audit: `{_fmt_amt(r['aud_total'])}`")
+        if n_issues == 0:
+            st.success("✅ All invoices passed validation.")
+        else:
+            st.warning(f"⚠️ {n_issues} invoice(s) need review — see the Excel report below.")
 
         # ── Export to Excel ────────────────────────────────────────────────────
         st.divider()
