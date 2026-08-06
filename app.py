@@ -901,10 +901,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             all_dates = _collect_dates(context)
             inv_date, due_date = _assign_dates(all_dates)
 
-            # Monetary amounts: collect unique values, sorted ascending
+            # Monetary amounts: filter out small values (< 10) that are likely
+            # tax rates (0.05), unit prices, or formatting artifacts, then take
+            # the largest remaining amount as the invoice total.
             raw_amounts = re.findall(r'\b([\d,]+\.\d{2})\b', context)
-            amounts_num = sorted({float(a.replace(",", "")) for a in raw_amounts})
-            net_amt   = amounts_num[0]  if amounts_num else None
+            amounts_num = sorted({
+                float(a.replace(",", "")) for a in raw_amounts
+                if float(a.replace(",", "")) >= 10.0
+            })
             total_amt = amounts_num[-1] if amounts_num else None
 
             records[invoice_no] = {
@@ -913,7 +917,6 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 "cc":           cc,
                 "vendor":       vendor,
                 "gl":           gl,
-                "net":          net_amt,
                 "total":        total_amt,
             }
 
@@ -962,6 +965,15 @@ def extract_invoice_amounts(pdf_bytes: bytes) -> dict:
             result["taxes"] = round(taxes_acc, 2)
         if last_total:
             result["total"] = last_total
+
+        # Fallback: compute missing value from the other two
+        net_f   = float(result["net"])   if result["net"]   else None
+        total_f = float(result["total"]) if result["total"] else None
+        if net_f is not None and total_f is not None:
+            computed_taxes = round(total_f - net_f, 2)
+            # Use computed taxes if direct extraction is missing or clearly wrong (>1 CAD off)
+            if result["taxes"] is None or abs(result["taxes"] - computed_taxes) > 1.0:
+                result["taxes"] = computed_taxes
 
     except Exception:
         pass
@@ -1908,11 +1920,8 @@ with tab_audit:
                 cc_aud       = aud.get("cc")
                 vendor_aud   = aud.get("vendor")
                 gl_aud       = aud.get("gl")
-                aud_net      = aud.get("net")    # float or None
-                aud_total    = aud.get("total")  # float or None
+                aud_total    = aud.get("total")  # float or None (largest amount in audit row)
 
-                # Amount comparison: try total first, then net
-                net_ok   = _cmp_amt(inv_net,   aud_net)
                 total_ok = _cmp_amt(inv_total, aud_total)
 
                 val_results.append({
@@ -1934,7 +1943,6 @@ with tab_audit:
                     "cc_aud":       cc_aud,
                     "vendor_aud":   vendor_aud,
                     "gl_aud":       gl_aud,
-                    "aud_net":      aud_net,
                     "aud_total":    aud_total,
                     # Validation flags
                     "inv_date_ok":  _cmp(inv_date, inv_date_aud),
@@ -1942,7 +1950,6 @@ with tab_audit:
                     "cc_ok":        _cmp(cc_ext, cc_aud),
                     "vendor_ok":    _cmp(vendor_ext, vendor_aud),
                     "gl_ok":        _cmp(gl_ext, gl_aud),
-                    "net_ok":       net_ok,
                     "total_ok":     total_ok,
                 })
 
@@ -1966,7 +1973,7 @@ with tab_audit:
             if v is None: return "—"
             return f"{float(v):,.2f}"
 
-        _all_flags = ["inv_date_ok", "due_date_ok", "cc_ok", "vendor_ok", "gl_ok", "net_ok", "total_ok"]
+        _all_flags = ["inv_date_ok", "due_date_ok", "cc_ok", "vendor_ok", "gl_ok", "total_ok"]
 
         n_found  = sum(1 for r in val_results if r["found"])
         n_all_ok = sum(
@@ -2052,40 +2059,27 @@ with tab_audit:
 
                     # ── Row 2: Amounts ─────────────────────────────────────────
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.markdown("**💰 Amounts**")
-                    a1, a2, a3, a4, a5 = st.columns(5)
+                    st.markdown("**💰 Amounts (CAD)**")
+                    a1, a2, a3, _ = st.columns([2, 2, 2, 3])
 
-                    # Net (subtotal)
                     with a1:
                         st.markdown("**Net (subtotal)**")
-                        st.markdown(f"<span style='font-size:20px;color:{'#28a745' if r['net_ok'] else ('#dc3545' if r['net_ok'] is False else '#6c757d')}'>{_icon(r['net_ok'])}</span>",
-                                    unsafe_allow_html=True)
                         st.caption(f"PDF: `{_fmt_amt(r['inv_net'])}`")
-                        st.caption(f"Audit: `{_fmt_amt(r['aud_net'])}`")
 
-                    # Taxes
                     with a2:
                         st.markdown("**Taxes (GST+QST)**")
-                        st.markdown("<span style='font-size:20px;color:#6c757d'>❓</span>",
-                                    unsafe_allow_html=True)
                         st.caption(f"PDF: `{_fmt_amt(r['inv_taxes'])}`")
-                        st.caption("Audit: `—`")
 
-                    # Total
                     with a3:
+                        tok = r["total_ok"]
+                        clr = "#28a745" if tok else ("#dc3545" if tok is False else "#6c757d")
                         st.markdown("**Total**")
-                        st.markdown(f"<span style='font-size:20px;color:{'#28a745' if r['total_ok'] else ('#dc3545' if r['total_ok'] is False else '#6c757d')}'>{_icon(r['total_ok'])}</span>",
-                                    unsafe_allow_html=True)
+                        st.markdown(
+                            f"<span style='font-size:20px;color:{clr}'>{_icon(tok)}</span>",
+                            unsafe_allow_html=True,
+                        )
                         st.caption(f"PDF: `{_fmt_amt(r['inv_total'])}`")
                         st.caption(f"Audit: `{_fmt_amt(r['aud_total'])}`")
-
-                    with a4:
-                        st.markdown("**Audit Net**")
-                        st.caption(f"`{_fmt_amt(r['aud_net'])}`")
-
-                    with a5:
-                        st.markdown("**Audit Total**")
-                        st.caption(f"`{_fmt_amt(r['aud_total'])}`")
 
         # ── Export to Excel ────────────────────────────────────────────────────
         st.divider()
@@ -2110,13 +2104,11 @@ with tab_audit:
                 "GL (PDF)":              r["gl_ext"]    or "",
                 "GL (Audit)":            r["gl_aud"]    or "",
                 "GL OK":                 _icon(r["gl_ok"]),
-                "Net (PDF)":             _fmt_amt(r["inv_net"]),
-                "Taxes (PDF)":           _fmt_amt(r["inv_taxes"]),
-                "Total (PDF)":           _fmt_amt(r["inv_total"]),
-                "Net (Audit)":           _fmt_amt(r["aud_net"]),
-                "Total (Audit)":         _fmt_amt(r["aud_total"]),
-                "Net OK":                _icon(r["net_ok"]),
-                "Total OK":              _icon(r["total_ok"]),
+                "Net/Subtotal (PDF)":    _fmt_amt(r["inv_net"]),
+                "Taxes GST+QST (PDF)":  _fmt_amt(r["inv_taxes"]),
+                "Total (PDF)":          _fmt_amt(r["inv_total"]),
+                "Total (Audit)":        _fmt_amt(r["aud_total"]),
+                "Total OK":             _icon(r["total_ok"]),
             })
         df_exp = pd.DataFrame(export_rows)
         buf_xl = BytesIO()
