@@ -881,7 +881,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
         sorted_ys = sorted(row_map.keys())
 
         # ── Pass 1: find all APINV rows ──────────────────────────────────────────
-        apinv_rows: list = []
+        apinv_rows: list = []  # [(yk, invoice_no, voucher_no)]
         for yk in sorted_ys:
             row_ws = row_map[yk]
             # Sort left-to-right so the regex finds "APINV <number>" in order
@@ -890,10 +890,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             if "APINV" not in row_tx.upper():
                 continue
 
+            # Voucher number: 1-4 digit integer immediately before "APINV"
+            mv = re.search(r'(?:^|\s)(\d{1,4})\s+APINV\b', row_tx, re.IGNORECASE)
+            voucher_no = mv.group(1) if mv else None
+
             # Regex on joined row text (works when APINV and number share a band)
             m = re.search(r'APINV\s+(\d{7,10})\b', row_tx, re.IGNORECASE)
             if m:
-                apinv_rows.append((yk, m.group(1)))
+                apinv_rows.append((yk, m.group(1), voucher_no))
                 continue
 
             # Fallback: find "APINV" word, then look right across nearby y-bands
@@ -908,14 +912,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 for ny in nearby:
                     for w in sorted(row_map[ny], key=lambda w: w["x0"]):
                         if w["x0"] >= apinv_x1 - 5 and re.match(r'^\d{7,10}$', w["text"]):
-                            apinv_rows.append((yk, w["text"]))
+                            apinv_rows.append((yk, w["text"], voucher_no))
                             found = True
                             break
                     if found:
                         break
 
         # ── Pass 2: extract fields from each bounded block ───────────────────────
-        for idx, (yk, invoice_no) in enumerate(apinv_rows):
+        for idx, (yk, invoice_no, voucher_no) in enumerate(apinv_rows):
             next_yk = (apinv_rows[idx + 1][0]
                        if idx + 1 < len(apinv_rows)
                        else max(sorted_ys) + 200)
@@ -985,6 +989,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 total_amt = amounts_num[-1] if amounts_num else None
 
             records[invoice_no] = {
+                "voucher":      voucher_no,
                 "invoice_date": inv_date,
                 "due_date":     due_date,
                 "cc":           cc,
@@ -1999,6 +2004,7 @@ with tab_audit:
 
                 audit_rec    = audit_data.get(invoice_no) if invoice_no else None
                 aud          = audit_rec or {}
+                voucher_aud  = aud.get("voucher")
                 inv_date_aud = aud.get("invoice_date")
                 due_date_aud = aud.get("due_date")
                 cc_aud       = aud.get("cc")
@@ -2022,6 +2028,7 @@ with tab_audit:
                     "inv_taxes":    inv_taxes,
                     "inv_total":    inv_total,
                     # From audit report
+                    "voucher_aud":  voucher_aud,
                     "inv_date_aud": inv_date_aud,
                     "due_date_aud": due_date_aud,
                     "cc_aud":       cc_aud,
@@ -2110,6 +2117,7 @@ with tab_audit:
                 "File":                  r["filename"],
                 "Invoice No":            r["invoice_no"],
                 "Found in Audit":        "Yes" if r["found"] else "No",
+                "Voucher No":            r.get("voucher_aud") or "",
                 "Inv Date (PDF)":        _fmt_date(r["inv_date"]),
                 "Inv Date (Audit)":      _fmt_date(r["inv_date_aud"]),
                 "Inv Date OK":           _icon(r["inv_date_ok"]),
