@@ -1565,27 +1565,38 @@ with tab_cod:
             st.session_state["_inv_ui_sig"]   = _sig
         invoices_ui = st.session_state["_inv_ui_cache"]
 
-        st.subheader("Review — Extracted Data")
-
         resolved_cc     = {}
         resolved_vendor = {}
         resolved_gl     = {}
 
+        n_auto   = sum(
+            1 for inv in invoices_ui
+            if not inv.get("error")
+            and (inv.get("invoice_no") or inv.get("customer_order"))
+            and not inv["needs_cc"]
+            and inv.get("gl_auto")
+        )
+        n_review = len(invoices_ui) - n_auto
+
+        if n_auto:
+            st.success(f"✅ {n_auto} invoice(s) auto-coded — no review needed.")
+        if n_review:
+            st.warning(f"⚠️ {n_review} invoice(s) require manual input — review below before coding.")
+
         for idx, inv in enumerate(invoices_ui):
-            has_err     = inv.get("error") or (not inv.get("invoice_no") and not inv.get("customer_order"))
+            has_err    = inv.get("error") or (not inv.get("invoice_no") and not inv.get("customer_order"))
             needs_input = inv["needs_cc"] or not inv.get("gl_auto")
+            auto_coded  = not has_err and not needs_input
 
-            if has_err:
-                icon, card_cls = "❌", "inv-card inv-err"
-                expanded = True
-            elif needs_input:
-                icon, card_cls = "⚠️", "inv-card inv-warn"
-                expanded = True
-            else:
-                icon, card_cls = "✅", "inv-card inv-ok"
-                expanded = False
+            if auto_coded:
+                # Pre-populate resolved dicts; no UI needed
+                resolved_vendor[idx] = VENDOR_EXCEPCION if inv.get("is_six") else inv["vendor_auto"]
+                resolved_cc[idx]     = inv["cc_auto"]
+                resolved_gl[idx]     = inv["gl_auto"]
+                continue
 
-            with st.expander(f"{icon}  {inv['filename']}", expanded=expanded):
+            icon = "❌" if has_err else "⚠️"
+            with st.expander(f"{icon}  {inv['filename']}", expanded=True):
                 c1, c2, c3 = st.columns([1.2, 1.2, 1])
 
                 with c1:
