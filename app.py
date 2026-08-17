@@ -829,6 +829,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
         re.compile(r'^\d{4}/\d{2}/\d{2}$'),
         re.compile(r'^\d{2}\.\d{2}\.\d{4}$'),
     ]
+    # Non-anchored versions for searching inside a reconstructed character run
+    _DATE_SEARCH_PATS = [
+        re.compile(r'\d{4}-\d{2}-\d{2}'),
+        re.compile(r'\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4}', re.I),
+        re.compile(r'\d{2}/\d{2}/\d{4}'),
+        re.compile(r'\d{4}/\d{2}/\d{2}'),
+        re.compile(r'\d{2}\.\d{2}\.\d{4}'),
+    ]
 
     def _is_date_word(text: str) -> "date | None":
         t = text.strip()
@@ -848,9 +856,52 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                     return d
         return None
 
+    def _chars_date(top_lo: float, top_hi: float, x_lo, x_hi) -> "date | None":
+        """
+        Read a date directly from the character stream within a y/x box.
+
+        Crystal Reports can overflow a long Party name into the date
+        column's x-range; both text runs then share the same x0 per
+        character cell, and pdfplumber's word merge garbles them into one
+        string (e.g. "0M2L6-08-12" instead of "2026-08-12"). Rebuilding
+        the cell from characters and picking, at each x0, the glyph most
+        likely to be a genuine date character (digit > separator > other)
+        recovers the real date even when the overflow text itself
+        contains a hyphen at that same position.
+        """
+        if x_lo is None or x_hi is None:
+            return None
+        cell = [c for c in all_chars
+                if top_lo <= c["top"] <= top_hi and x_lo - 5 <= c["x0"] < x_hi]
+        if not cell:
+            return None
+
+        def _priority(t: str) -> int:
+            if t.isdigit():
+                return 2
+            if t in "-/.":
+                return 1
+            return 0
+
+        by_x = {}
+        for c in cell:
+            x0 = round(c["x0"], 1)
+            t = c["text"]
+            pr = _priority(t)
+            prev = by_x.get(x0)
+            if prev is None or pr > prev[1]:
+                by_x[x0] = (t, pr)
+        s = "".join(v[0] for _, v in sorted(by_x.items()))
+        for p in _DATE_SEARCH_PATS:
+            m = p.search(s)
+            if m:
+                return _parse_date_str(m.group(0))
+        return None
+
     try:
         # ── Merge all pages into one coordinate space ────────────────────────────
         all_words: list = []
+        all_chars: list = []
         y_offset = 0.0
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
@@ -863,10 +914,25 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                     nw["top"]    = w["top"]    + y_offset
                     nw["bottom"] = w["bottom"] + y_offset
                     all_words.append(nw)
+                for ch in page.chars:
+                    nc = dict(ch)
+                    nc["top"] = ch["top"] + y_offset
+                    all_chars.append(nc)
                 y_offset += page.height
 
         if not all_words:
             return records
+
+        # Date column x-range, from the "Invoice Date / Due Date" header
+        # (both sub-labels start at the same x0 as the column itself).
+        date_col_x0, date_col_x1 = None, None
+        for w in all_words:
+            if w["text"] in ("Invoice", "Due") and date_col_x0 is None:
+                date_col_x0 = w["x0"]
+            if w["text"] == "Year" and date_col_x1 is None:
+                date_col_x1 = w["x0"]
+            if date_col_x0 is not None and date_col_x1 is not None:
+                break
 
         # Group into y-rows with 6 pt tolerance (Crystal Reports may offset
         # words on the same visual line by up to 5 pt)
@@ -948,11 +1014,18 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             # invoice-number row (±6 pt — Crystal Reports row tolerance).
             # Due date: the next date word in the following rows within the
             # block (it sits directly under the invoice date, one line down).
-            same_row_ys = [y for y in sorted_ys if abs(y - yk) <= 6]
-            inv_date = _row_date(same_row_ys)
+            # Character-based read (handles Party-name overflow into the
+            # date column) is tried first; word-based scan is the fallback.
+            block_cap = min(yk + 45, next_yk)
+            inv_date = _chars_date(yk - 6, yk + 6, date_col_x0, date_col_x1)
+            due_date = _chars_date(yk + 6, block_cap, date_col_x0, date_col_x1)
 
-            below_ys = [y for y in sorted_ys if yk + 6 < y <= yk + 45]
-            due_date = _row_date(below_ys)
+            if inv_date is None:
+                same_row_ys = [y for y in sorted_ys if abs(y - yk) <= 6]
+                inv_date = _row_date(same_row_ys)
+            if due_date is None:
+                below_ys = [y for y in sorted_ys if yk + 6 < y <= block_cap]
+                due_date = _row_date(below_ys)
 
             # Total: find the 'Total:' label row (not Sub-Total / Sous-Total)
             total_amt = None
