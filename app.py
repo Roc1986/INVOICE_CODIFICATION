@@ -2164,25 +2164,39 @@ with tab_pay:
     st.markdown(
         "This tool works entirely through **upload / download** — it does **not** need access "
         "to your computer's folders or network drives, so it works from any browser without "
-        "installing anything.\n\n"
-        "1. Upload the **Excel/CSV** with the filenames selected for this payment.\n"
-        "2. Add each **unpaid folder** separately (its name/vendor + all its current PDFs) — "
-        "one folder at a time, as many as you need.\n"
+        "installing anything. Invoices are matched by **invoice number**: the first **8 "
+        "characters** of each PDF's filename, against the **Reference** column (column **E**) "
+        "of the AP payment report.\n\n"
+        "1. Upload the **payment report** (Excel/CSV) — the list of invoices to pay.\n"
+        "2. Add each **unpaid folder** separately (its name/vendor + all its current PDFs, "
+        "paid or not) — one folder at a time, as many as you need.\n"
         "3. Click **Build payment packages** — you'll get a ZIP for the **Paid folder (AP / "
         "Vendors)**, a ZIP for the **payment-number folder (Finance)**, and — for each unpaid "
         "folder you added — a ready-to-swap-in **updated unpaid ZIP** with the paid invoices "
         "already removed, so you replace the whole folder instead of hunting files to delete."
     )
 
-    # ── 1. Selected invoices file ────────────────────────────────────────────
-    st.markdown("**1. Selected invoices file**")
+    def _pay_clean_ref(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return ""
+        if re.fullmatch(r"\d+\.0+", s):
+            s = s.split(".")[0]
+        return s
+
+    # ── 1. Payment report ────────────────────────────────────────────────────
+    st.markdown("**1. Payment report (invoices to pay)**")
     pay_list_file = st.file_uploader(
-        "Excel or CSV with the filenames selected for payment",
+        "Excel or CSV with the invoices selected for payment",
         type=["xlsx", "xls", "csv"],
         key="pay_list_upload",
     )
 
-    pay_filenames = []
+    pay_invoices = []
     if pay_list_file:
         df_pay = None
         try:
@@ -2194,23 +2208,26 @@ with tab_pay:
             st.error(f"Could not read the file: {e}")
 
         if df_pay is not None and len(df_pay.columns):
-            guess_idx = 0
+            guess_idx = 4 if len(df_pay.columns) > 4 else 0
             for i, c in enumerate(df_pay.columns):
-                if re.search(r"archivo|file|factura|nombre|name", str(c), re.I):
+                if re.search(r"reference|referencia|factura|invoice", str(c), re.I):
                     guess_idx = i
                     break
             pay_col = st.selectbox(
-                "Column with the invoice filename",
+                "Column with the invoice number (defaults to column E — Reference)",
                 options=list(df_pay.columns),
                 index=guess_idx,
                 key="pay_col_select",
             )
-            st.caption("Values must match the file name exactly, including the extension (e.g. `.pdf`).")
-            pay_filenames = [
-                str(v).strip() for v in df_pay[pay_col].tolist()
-                if v is not None and str(v).strip() and str(v).strip().lower() != "nan"
+            st.caption(
+                "Compared against the first 8 characters of each PDF's filename — "
+                "e.g. `92006209_ML_24289954.pdf` → `92006209`."
+            )
+            pay_invoices = [
+                _pay_clean_ref(v) for v in df_pay[pay_col].tolist()
             ]
-            st.caption(f"{len(pay_filenames)} filename(s) loaded from **{pay_col}**")
+            pay_invoices = [v for v in pay_invoices if v]
+            st.caption(f"{len(pay_invoices)} invoice(s) loaded from **{pay_col}**")
 
     st.divider()
 
@@ -2273,27 +2290,28 @@ with tab_pay:
 
     st.divider()
 
-    can_build = bool(pay_filenames and st.session_state.payment_batches and payment_no_txt.strip())
+    can_build = bool(pay_invoices and st.session_state.payment_batches and payment_no_txt.strip())
     if st.button("📦 Build payment packages", type="primary", disabled=not can_build):
-        # Index every uploaded file across all folders, by lowercase filename.
+        # Index every uploaded file across all folders, by invoice No. (first 8 chars of filename).
         upload_index = {}
         for b in st.session_state.payment_batches:
             for f in b["files"]:
-                upload_index.setdefault(f["name"].lower(), []).append(f)
+                inv_key = f["name"][:8]
+                upload_index.setdefault(inv_key, []).append(f)
 
         rows = []
-        for name in pay_filenames:
-            matches = upload_index.get(name.lower(), [])
+        for inv_no in pay_invoices:
+            matches = upload_index.get(inv_no, [])
             if len(matches) == 1:
                 status = "found"
             elif len(matches) > 1:
                 status = "duplicate"
             else:
                 status = "not_found"
-            rows.append({"filename": name, "matches": matches, "status": status})
+            rows.append({"invoice_no": inv_no, "matches": matches, "status": status})
 
         to_pack = [r for r in rows if r["status"] == "found"]
-        paid_names_lower = {r["matches"][0]["name"].lower() for r in to_pack}
+        paid_keys = {r["invoice_no"] for r in to_pack}
 
         zip_paid_buf = BytesIO()
         with zipfile.ZipFile(zip_paid_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2310,7 +2328,7 @@ with tab_pay:
         # One "updated unpaid" ZIP per folder — everything except what just got paid.
         remaining_zips = []
         for b in st.session_state.payment_batches:
-            remaining = [f for f in b["files"] if f["name"].lower() not in paid_names_lower]
+            remaining = [f for f in b["files"] if f["name"][:8] not in paid_keys]
             buf = BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f in remaining:
@@ -2324,7 +2342,9 @@ with tab_pay:
             })
 
         report_rows = [{
-            "File": r["filename"],
+            "Invoice No":    r["invoice_no"],
+            "File":          r["matches"][0]["name"] if len(r["matches"]) == 1 else
+                              "; ".join(m["name"] for m in r["matches"]) if r["matches"] else "",
             "Status": {"found": "Packaged", "duplicate": "Duplicate — review",
                        "not_found": "Not found"}[r["status"]],
         } for r in rows]
@@ -2335,7 +2355,11 @@ with tab_pay:
 
         st.session_state.payment_result = {
             "payment_no":     payment_no_txt.strip(),
-            "rows":           [{"filename": r["filename"], "status": r["status"]} for r in rows],
+            "rows":           [{
+                "invoice_no": r["invoice_no"],
+                "status":     r["status"],
+                "files":      [m["name"] for m in r["matches"]],
+            } for r in rows],
             "zip_paid":       zip_paid_buf.getvalue(),
             "zip_finance":    zip_finance_buf.getvalue(),
             "report_xlsx":    buf_report.getvalue(),
@@ -2373,20 +2397,23 @@ with tab_pay:
         st.markdown("<br>", unsafe_allow_html=True)
         _pay_status_lbl = {"found": "✅ Packaged", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
         df_preview = pd.DataFrame([{
-            "File": r["filename"], "Status": _pay_status_lbl[r["status"]],
+            "Invoice No": r["invoice_no"],
+            "File(s)":    "; ".join(r["files"]) if r["files"] else "—",
+            "Status":     _pay_status_lbl[r["status"]],
         } for r in rows])
         st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
         if n_dup:
             st.warning(
-                "⚠️ Some uploaded files share the same name across folders — those are skipped "
-                "automatically (in both the paid package and every 'updated unpaid' ZIP) so the "
-                "wrong file isn't moved. Resolve them manually, then rebuild."
+                "⚠️ Some invoice numbers matched more than one uploaded PDF (same first 8 "
+                "characters, possibly in different folders) — those are skipped automatically "
+                "(in both the paid package and every 'updated unpaid' ZIP) so the wrong file "
+                "isn't moved. Resolve them manually, then rebuild."
             )
         if n_not_found:
             st.info(
-                "ℹ️ Files marked **Not found** weren't among the uploaded PDFs — check the "
-                "filename or upload the right folder and build the packages again."
+                "ℹ️ Invoice numbers marked **Not found** weren't among the uploaded PDFs — check "
+                "the number or upload the right folder and build the packages again."
             )
 
         if n_found:
