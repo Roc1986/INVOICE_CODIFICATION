@@ -115,8 +115,9 @@ def init_state():
         "audit_results":       None,
         "audit_data_count":    0,
         # Payment Packager state
-        "payment_result":       None,
-        "payment_batches":      [],   # [{"label", "files": [{"name", "bytes"}]}]
+        "payment_result":          None,
+        "payment_batches":         [],   # [{"label", "files": [{"name", "bytes"}]}]
+        "payment_batch_form_key":  0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2302,19 +2303,26 @@ with tab_pay:
     st.caption(
         "Add every unpaid folder that might contain a selected invoice. Upload **all** the PDFs "
         "currently in that folder (not just the ones being paid) so the tool can hand back a "
-        "complete, ready-to-swap-in replacement for it."
+        "complete, ready-to-swap-in replacement for it. If you upload everything in one single "
+        "batch instead of folder by folder, any label works (e.g. `Unpaid`) — it's only used to "
+        "name the ZIP you get back, it doesn't affect the matching."
     )
 
     existing_labels = {b["label"].lower() for b in st.session_state.payment_batches}
-    with st.form("pay_add_batch_form", clear_on_submit=True):
-        fc1, fc2 = st.columns([1, 2])
-        with fc1:
-            batch_label = st.text_input("Folder name / vendor No.", placeholder="0101000430")
-        with fc2:
-            batch_files = st.file_uploader(
-                "All PDFs currently in that folder", type=["pdf"], accept_multiple_files=True,
-            )
-        add_batch = st.form_submit_button("➕ Add this folder")
+    _pay_form_key = st.session_state.payment_batch_form_key
+    fc1, fc2 = st.columns([1, 2])
+    with fc1:
+        batch_label = st.text_input(
+            "Folder name / vendor No.",
+            placeholder="0101000430",
+            key=f"pay_batch_label_{_pay_form_key}",
+        )
+    with fc2:
+        batch_files = st.file_uploader(
+            "All PDFs currently in that folder", type=["pdf"], accept_multiple_files=True,
+            key=f"pay_batch_files_{_pay_form_key}",
+        )
+    add_batch = st.button("➕ Add this folder")
 
     if add_batch:
         label = batch_label.strip()
@@ -2329,6 +2337,7 @@ with tab_pay:
                 "label": label,
                 "files": [{"name": f.name, "bytes": f.getvalue()} for f in batch_files],
             })
+            st.session_state.payment_batch_form_key += 1
             st.rerun()
 
     if st.session_state.payment_batches:
