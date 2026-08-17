@@ -2277,7 +2277,7 @@ with tab_pay:
         if df_pay is not None and len(df_pay.columns):
             guess_idx = 4 if len(df_pay.columns) > 4 else 0
             for i, c in enumerate(df_pay.columns):
-                if re.search(r"reference|referencia|factura|invoice", str(c), re.I):
+                if re.search(r"reference|referencia", str(c), re.I):
                     guess_idx = i
                     break
             pay_col = st.selectbox(
@@ -2400,6 +2400,14 @@ with tab_pay:
                 zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
         zip_finance_buf.seek(0)
 
+        payment_no_clean = payment_no_txt.strip()
+
+        # Everything that will also go into the combined "download all" ZIP.
+        all_entries = []
+        for r in to_pack:
+            all_entries.append((f"Facturas Pagadas (AP)/{r['matches'][0]['name']}", r["matches"][0]["bytes"]))
+            all_entries.append((f"Finanzas - {payment_no_clean}/{r['matches'][0]['name']}", r["matches"][0]["bytes"]))
+
         # One "updated unpaid" ZIP per folder — everything except what just got paid.
         remaining_zips = []
         for b in st.session_state.payment_batches:
@@ -2415,6 +2423,9 @@ with tab_pay:
                 "removed": len(b["files"]) - len(remaining),
                 "remaining": len(remaining),
             })
+            safe_label = b["label"].replace("/", "-").replace("\\", "-")
+            for f in remaining:
+                all_entries.append((f"Unpaid - {safe_label}/{f['name']}", f["bytes"]))
 
         report_rows = [{
             "Invoice No":    r["invoice_no"],
@@ -2427,9 +2438,16 @@ with tab_pay:
         with pd.ExcelWriter(buf_report, engine="openpyxl") as xl_writer:
             pd.DataFrame(report_rows).to_excel(xl_writer, index=False)
         buf_report.seek(0)
+        all_entries.append((f"Checklist_{payment_no_clean}.xlsx", buf_report.getvalue()))
+
+        zip_all_buf = BytesIO()
+        with zipfile.ZipFile(zip_all_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, data in all_entries:
+                zf.writestr(arcname, data)
+        zip_all_buf.seek(0)
 
         st.session_state.payment_result = {
-            "payment_no":     payment_no_txt.strip(),
+            "payment_no":     payment_no_clean,
             "rows":           [{
                 "invoice_no": r["invoice_no"],
                 "status":     r["status"],
@@ -2439,6 +2457,7 @@ with tab_pay:
             "zip_finance":    zip_finance_buf.getvalue(),
             "report_xlsx":    buf_report.getvalue(),
             "remaining_zips": remaining_zips,
+            "zip_all":        zip_all_buf.getvalue(),
         }
 
     # ── Results ───────────────────────────────────────────────────────────────
@@ -2470,13 +2489,6 @@ with tab_pay:
                 f"<div class='stat-lbl'>Not found</div></div>", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        _pay_status_lbl = {"found": "✅ Packaged", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
-        df_preview = pd.DataFrame([{
-            "Invoice No": r["invoice_no"],
-            "File(s)":    "; ".join(r["files"]) if r["files"] else "—",
-            "Status":     _pay_status_lbl[r["status"]],
-        } for r in rows])
-        st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
         if n_dup:
             st.warning(
@@ -2493,44 +2505,59 @@ with tab_pay:
 
         if n_found:
             st.success(f"✅ {n_found} invoice(s) packaged.")
-            dcol1, dcol2, dcol3 = st.columns(3)
-            with dcol1:
-                st.download_button(
-                    "⬇️ Paid folder ZIP (AP / Vendors)",
-                    data=result["zip_paid"],
-                    file_name=f"facturas_pagadas_{date.today().strftime('%Y%m%d')}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            with dcol2:
-                st.download_button(
-                    "⬇️ Finance ZIP (payment " + result["payment_no"] + ")",
-                    data=result["zip_finance"],
-                    file_name=f"pago_{result['payment_no']}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            with dcol3:
-                st.download_button(
-                    "⬇️ Checklist (Excel)",
-                    data=result["report_xlsx"],
-                    file_name=f"payment_checklist_{result['payment_no']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
 
+            st.download_button(
+                "⬇️ Download everything (ZIP)",
+                data=result["zip_all"],
+                file_name=f"pago_{result['payment_no']}_completo.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+            )
+            st.caption(
+                "Contains the Paid folder, the Finance folder, the checklist, and every "
+                "updated unpaid folder — each in its own subfolder, ready to copy into place."
+            )
             st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("**📁 Updated unpaid folders — replace each folder's contents with its ZIP**")
-            for rz in result["remaining_zips"]:
-                safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", rz["label"])
-                st.download_button(
-                    f"⬇️ Unpaid — {rz['label']}  ({rz['removed']} removed, {rz['remaining']} remaining)",
-                    data=rz["zip"],
-                    file_name=f"unpaid_{safe_label}_{date.today().strftime('%Y%m%d')}.zip",
-                    mime="application/zip",
-                    key=f"pay_remaining_dl_{safe_label}",
-                    use_container_width=True,
-                )
+
+            with st.expander("Or download each piece separately"):
+                dcol1, dcol2, dcol3 = st.columns(3)
+                with dcol1:
+                    st.download_button(
+                        "⬇️ Paid folder ZIP (AP / Vendors)",
+                        data=result["zip_paid"],
+                        file_name=f"facturas_pagadas_{date.today().strftime('%Y%m%d')}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+                with dcol2:
+                    st.download_button(
+                        "⬇️ Finance ZIP (payment " + result["payment_no"] + ")",
+                        data=result["zip_finance"],
+                        file_name=f"pago_{result['payment_no']}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+                with dcol3:
+                    st.download_button(
+                        "⬇️ Checklist (Excel)",
+                        data=result["report_xlsx"],
+                        file_name=f"payment_checklist_{result['payment_no']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
+                st.markdown("**📁 Updated unpaid folders — replace each folder's contents with its ZIP**")
+                for rz in result["remaining_zips"]:
+                    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", rz["label"])
+                    st.download_button(
+                        f"⬇️ Unpaid — {rz['label']}  ({rz['removed']} removed, {rz['remaining']} remaining)",
+                        data=rz["zip"],
+                        file_name=f"unpaid_{safe_label}_{date.today().strftime('%Y%m%d')}.zip",
+                        mime="application/zip",
+                        key=f"pay_remaining_dl_{safe_label}",
+                        use_container_width=True,
+                    )
 
             st.info(
                 "💡 **Next steps:** unzip the Paid ZIP into your **AP / Vendors paid** folder, "
