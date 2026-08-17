@@ -14,9 +14,6 @@ import zipfile
 import re
 import copy
 import json
-import os
-import shutil
-from pathlib import Path
 import pandas as pd
 from datetime import date, datetime, timedelta
 import openpyxl
@@ -117,14 +114,8 @@ def init_state():
         # AP Audit state
         "audit_results":       None,
         "audit_data_count":    0,
-        # Payment Mover state
-        "payment_unpaid_paths":  "",
-        "payment_paid_folder":   "",
-        "payment_finance_base":  "",
-        "payment_recursive":     True,
-        "payment_overwrite":     False,
-        "payment_preview":       None,
-        "payment_move_log":      None,
+        # Payment Packager state
+        "payment_result":       None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1198,7 +1189,7 @@ tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_pay, tab_db, tab_cfg = 
     "🏷️  Invoice Coding",
     "📊  Couru Code",
     "🔍  AP Audit",
-    "💳  Payment Mover",
+    "💳  Payment Packager",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -2165,21 +2156,22 @@ with tab_audit:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — PAYMENT MOVER
+# TAB 6 — PAYMENT PACKAGER
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_pay:
-    st.subheader("💳 Payment Mover — Move Selected Invoices to Payment Folders")
+    st.subheader("💳 Payment Packager — Build the invoice packages for a payment run")
     st.markdown(
-        "Upload the **Excel/CSV** listing the invoice filenames selected for this payment run. "
-        "The tool searches one or more **unpaid** folders (recursively), then **copies each "
-        "matched invoice** into the **AP / Vendors paid folder** and into a **Finance folder "
-        "named after the payment number** — the original is removed from the unpaid folder only "
-        "after both copies succeed."
-    )
-    st.warning(
-        "⚠️ This only works when the app runs **locally** (or on a server) with direct access to "
-        "the folder paths below — e.g. mapped network drives. It will **not** work on a "
-        "browser-only / cloud-hosted deployment with no filesystem access."
+        "This tool works entirely through **upload / download** — it does **not** need access "
+        "to your computer's folders or network drives, so it works from any browser without "
+        "installing anything.\n\n"
+        "1. Upload the **Excel/CSV** with the filenames selected for this payment.\n"
+        "2. Upload the **invoice PDFs** — select all the files from an unpaid folder at once "
+        "(e.g. `Ctrl+A` in the file picker); if the invoices are spread across several unpaid "
+        "folders, click **Browse files** again for each extra folder — everything you add stays "
+        "in the list.\n"
+        "3. Click **Build payment packages** — you'll get two ZIP files ready to drop into the "
+        "**Paid folder (AP / Vendors)** and the **payment-number folder (Finance)**, plus a "
+        "checklist to know exactly which files to remove from the unpaid folder(s)."
     )
 
     # ── 1. Selected invoices file ────────────────────────────────────────────
@@ -2222,117 +2214,97 @@ with tab_pay:
 
     st.divider()
 
-    # ── 2. Source / destination folders ──────────────────────────────────────
-    st.markdown("**2. Folders**")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        unpaid_paths_txt = st.text_area(
-            "Unpaid folder(s) — one path per line",
-            value=st.session_state.payment_unpaid_paths,
-            height=100,
-            placeholder="\\\\server\\share\\Unpaid\\Vendor0101000430\n\\\\server\\share\\Unpaid\\Vendor0101002430",
-            key="pay_unpaid_paths_input",
-        )
-        pay_recursive = st.checkbox(
-            "Search subfolders recursively",
-            value=st.session_state.payment_recursive,
-            key="pay_recursive_input",
-        )
-    with col_b:
-        paid_folder_txt = st.text_input(
-            "Paid invoices folder (AP / Vendors)",
-            value=st.session_state.payment_paid_folder,
-            key="pay_paid_folder_input",
-        )
-        finance_base_txt = st.text_input(
-            "Finance base folder (a subfolder named with the payment number is created here)",
-            value=st.session_state.payment_finance_base,
-            key="pay_finance_base_input",
-        )
-        payment_no_txt = st.text_input(
-            "Payment number",
-            value="",
-            placeholder="e.g. PAY-2026-08-17-001",
-            key="pay_number_input",
-        )
-        pay_overwrite = st.checkbox(
-            "Overwrite if the file already exists at destination",
-            value=st.session_state.payment_overwrite,
-            key="pay_overwrite_input",
-        )
-
-    # persist folder settings for convenience across reruns
-    st.session_state.payment_unpaid_paths = unpaid_paths_txt
-    st.session_state.payment_paid_folder  = paid_folder_txt
-    st.session_state.payment_finance_base = finance_base_txt
-    st.session_state.payment_recursive    = pay_recursive
-    st.session_state.payment_overwrite    = pay_overwrite
+    # ── 2. Invoice files ──────────────────────────────────────────────────────
+    st.markdown("**2. Invoice files (from one or more unpaid folders)**")
+    pay_invoice_uploads = st.file_uploader(
+        "Select all the invoice PDFs — add more from other folders as needed",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pay_invoice_upload",
+    )
+    if pay_invoice_uploads:
+        st.caption(f"{len(pay_invoice_uploads)} file(s) uploaded so far")
 
     st.divider()
 
-    # ── 3. Preview ────────────────────────────────────────────────────────────
-    do_preview = st.button(
-        "🔍 Preview matches",
-        type="primary",
-        disabled=not (pay_filenames and unpaid_paths_txt.strip()),
+    # ── 3. Payment number ─────────────────────────────────────────────────────
+    st.markdown("**3. Payment number**")
+    payment_no_txt = st.text_input(
+        "Used to name the Finance package/folder",
+        value="",
+        placeholder="e.g. PAY-2026-08-17-001",
+        key="pay_number_input",
     )
 
-    if do_preview:
-        roots = [p.strip() for p in unpaid_paths_txt.splitlines() if p.strip()]
-        index = {}  # lower(filename) -> [Path, ...]
-        bad_roots = []
-        for root in roots:
-            root_path = Path(root)
-            if not root_path.is_dir():
-                bad_roots.append(root)
-                continue
-            if pay_recursive:
-                walker = os.walk(root_path)
-            else:
-                walker = [(str(root_path), [], [f.name for f in root_path.iterdir() if f.is_file()])]
-            for dirpath, _dirnames, filenames in walker:
-                for fn in filenames:
-                    index.setdefault(fn.lower(), []).append(Path(dirpath) / fn)
+    st.divider()
 
-        if bad_roots:
-            st.error(
-                "The following folder(s) don't exist or aren't accessible:\n"
-                + "\n".join(f"- {b}" for b in bad_roots)
-            )
+    can_build = bool(pay_filenames and pay_invoice_uploads and payment_no_txt.strip())
+    if st.button("📦 Build payment packages", type="primary", disabled=not can_build):
+        # Index uploaded files by lowercase filename, flagging duplicates.
+        upload_index = {}
+        for uf in pay_invoice_uploads:
+            upload_index.setdefault(uf.name.lower(), []).append(uf)
 
-        preview_rows = []
+        rows = []
         for name in pay_filenames:
-            matches = index.get(name.lower(), [])
+            matches = upload_index.get(name.lower(), [])
             if len(matches) == 1:
                 status = "found"
             elif len(matches) > 1:
                 status = "duplicate"
             else:
                 status = "not_found"
-            preview_rows.append({
-                "filename": name,
-                "matches": [str(m) for m in matches],
-                "status": status,
-            })
-        st.session_state.payment_preview  = preview_rows
-        st.session_state.payment_move_log = None
+            rows.append({"filename": name, "matches": matches, "status": status})
 
-    # ── Preview results ───────────────────────────────────────────────────────
-    if st.session_state.payment_preview:
-        pay_rows    = st.session_state.payment_preview
-        n_found     = sum(1 for r in pay_rows if r["status"] == "found")
-        n_dup       = sum(1 for r in pay_rows if r["status"] == "duplicate")
-        n_not_found = sum(1 for r in pay_rows if r["status"] == "not_found")
+        to_pack = [r for r in rows if r["status"] == "found"]
+
+        zip_paid_buf = BytesIO()
+        with zipfile.ZipFile(zip_paid_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in to_pack:
+                zf.writestr(r["matches"][0].name, r["matches"][0].getvalue())
+        zip_paid_buf.seek(0)
+
+        zip_finance_buf = BytesIO()
+        with zipfile.ZipFile(zip_finance_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in to_pack:
+                zf.writestr(r["matches"][0].name, r["matches"][0].getvalue())
+        zip_finance_buf.seek(0)
+
+        report_rows = [{
+            "File": r["filename"],
+            "Status": {"found": "Packaged", "duplicate": "Duplicate — review",
+                       "not_found": "Not found"}[r["status"]],
+        } for r in rows]
+        buf_report = BytesIO()
+        with pd.ExcelWriter(buf_report, engine="openpyxl") as xl_writer:
+            pd.DataFrame(report_rows).to_excel(xl_writer, index=False)
+        buf_report.seek(0)
+
+        st.session_state.payment_result = {
+            "payment_no":   payment_no_txt.strip(),
+            "rows":         [{"filename": r["filename"], "status": r["status"]} for r in rows],
+            "zip_paid":     zip_paid_buf.getvalue(),
+            "zip_finance":  zip_finance_buf.getvalue(),
+            "report_xlsx":  buf_report.getvalue(),
+        }
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    result = st.session_state.get("payment_result")
+    if result:
+        rows        = result["rows"]
+        n_found     = sum(1 for r in rows if r["status"] == "found")
+        n_dup       = sum(1 for r in rows if r["status"] == "duplicate")
+        n_not_found = sum(1 for r in rows if r["status"] == "not_found")
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.markdown(
-                f"<div class='stat-box'><div class='stat-num blue'>{len(pay_rows)}</div>"
+                f"<div class='stat-box'><div class='stat-num blue'>{len(rows)}</div>"
                 f"<div class='stat-lbl'>Selected</div></div>", unsafe_allow_html=True)
         with c2:
             st.markdown(
                 f"<div class='stat-box'><div class='stat-num green'>{n_found}</div>"
-                f"<div class='stat-lbl'>Ready to move</div></div>", unsafe_allow_html=True)
+                f"<div class='stat-lbl'>Packaged</div></div>", unsafe_allow_html=True)
         with c3:
             col_c = "amber" if n_dup else "green"
             st.markdown(
@@ -2345,105 +2317,55 @@ with tab_pay:
                 f"<div class='stat-lbl'>Not found</div></div>", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        _pay_status_lbl = {"found": "✅ Ready", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
+        _pay_status_lbl = {"found": "✅ Packaged", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
         df_preview = pd.DataFrame([{
-            "File":         r["filename"],
-            "Status":       _pay_status_lbl[r["status"]],
-            "Location(s)":  "\n".join(r["matches"]) if r["matches"] else "—",
-        } for r in pay_rows])
+            "File": r["filename"], "Status": _pay_status_lbl[r["status"]],
+        } for r in rows])
         st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
         if n_dup:
             st.warning(
-                "⚠️ Duplicate filenames were found in more than one unpaid folder — these are "
-                "skipped automatically. Resolve them manually, then re-run the preview."
+                "⚠️ Some uploaded files share the same name — those are skipped automatically "
+                "so the wrong file isn't packaged. Remove the extra copy and re-upload."
             )
         if n_not_found:
-            st.info("ℹ️ Files marked **Not found** are skipped — check the filename or the folder paths.")
+            st.info(
+                "ℹ️ Files marked **Not found** weren't among the uploaded PDFs — check the "
+                "filename or upload them and build the packages again."
+            )
 
-        # ── 4. Move ───────────────────────────────────────────────────────────
-        st.divider()
-        st.markdown("**3. Move**")
-        pay_confirm = st.checkbox(
-            f"I confirm I want to move **{n_found}** invoice(s) out of the unpaid folder(s) into "
-            f"the Paid and Finance folders.",
-            key="pay_confirm_move",
-        )
-        pay_dest_ready = bool(paid_folder_txt.strip() and finance_base_txt.strip() and payment_no_txt.strip())
-        can_move = pay_confirm and n_found > 0 and pay_dest_ready
-        if n_found and not pay_dest_ready:
-            st.info("ℹ️ Fill in the Paid folder, Finance base folder and Payment number to enable the move.")
-
-        if st.button("📦 Move invoices now", type="primary", disabled=not can_move):
-            paid_dir    = Path(paid_folder_txt.strip())
-            finance_dir = Path(finance_base_txt.strip()) / payment_no_txt.strip()
-            try:
-                paid_dir.mkdir(parents=True, exist_ok=True)
-                finance_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                st.error(f"Could not create destination folder(s): {e}")
-                st.stop()
-
-            move_log = []
-            to_move  = [r for r in pay_rows if r["status"] == "found"]
-            prog = st.progress(0, text="Moving…")
-            for i, r in enumerate(to_move):
-                prog.progress(i / max(len(to_move), 1), text=f"Moving {r['filename']}…")
-                src          = Path(r["matches"][0])
-                dest_paid    = paid_dir / src.name
-                dest_finance = finance_dir / src.name
-                entry = {
-                    "filename":     src.name,
-                    "source":       str(src),
-                    "paid_dest":    str(dest_paid),
-                    "finance_dest": str(dest_finance),
-                    "status":       "",
-                    "detail":       "",
-                }
-                try:
-                    if not pay_overwrite and (dest_paid.exists() or dest_finance.exists()):
-                        entry["status"] = "skipped"
-                        entry["detail"] = "Already exists at destination"
-                    else:
-                        shutil.copy2(src, dest_paid)
-                        shutil.copy2(src, dest_finance)
-                        os.remove(src)
-                        entry["status"] = "moved"
-                except Exception as e:
-                    entry["status"] = "error"
-                    entry["detail"] = str(e)
-                move_log.append(entry)
-            prog.progress(1.0, text="✅ Done")
-            st.session_state.payment_move_log = move_log
-            st.rerun()
-
-    # ── Move results / log ───────────────────────────────────────────────────
-    if st.session_state.payment_move_log:
-        move_log  = st.session_state.payment_move_log
-        n_moved   = sum(1 for e in move_log if e["status"] == "moved")
-        n_skipped = sum(1 for e in move_log if e["status"] == "skipped")
-        n_error   = sum(1 for e in move_log if e["status"] == "error")
-
-        if n_error:
-            st.error(f"⚠️ {n_moved} moved, {n_skipped} skipped, {n_error} error(s) — see the log below.")
-        elif n_skipped:
-            st.warning(f"✅ {n_moved} moved, {n_skipped} skipped (already existed at destination).")
-        else:
-            st.success(f"✅ {n_moved} invoice(s) moved to the Paid and Finance folders.")
-
-        df_log = pd.DataFrame(move_log)
-        st.dataframe(df_log, use_container_width=True, hide_index=True)
-
-        buf_log = BytesIO()
-        with pd.ExcelWriter(buf_log, engine="openpyxl") as xl_writer:
-            df_log.to_excel(xl_writer, index=False)
-        buf_log.seek(0)
-        st.download_button(
-            "⬇️ Download move log (Excel)",
-            data=buf_log.read(),
-            file_name=f"payment_move_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if n_found:
+            st.success(f"✅ {n_found} invoice(s) packaged into two ZIP files.")
+            dcol1, dcol2, dcol3 = st.columns(3)
+            with dcol1:
+                st.download_button(
+                    "⬇️ Paid folder ZIP (AP / Vendors)",
+                    data=result["zip_paid"],
+                    file_name=f"facturas_pagadas_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with dcol2:
+                st.download_button(
+                    "⬇️ Finance ZIP (payment " + result["payment_no"] + ")",
+                    data=result["zip_finance"],
+                    file_name=f"pago_{result['payment_no']}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with dcol3:
+                st.download_button(
+                    "⬇️ Checklist (Excel)",
+                    data=result["report_xlsx"],
+                    file_name=f"payment_checklist_{result['payment_no']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            st.info(
+                "💡 **Next steps:** unzip the first file into your **Paid (AP)** folder, unzip the "
+                "second into the **Finance / payment-number** folder, then use the checklist to "
+                "delete the packaged files from the unpaid folder(s)."
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
