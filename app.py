@@ -114,6 +114,9 @@ def init_state():
         # AP Audit state
         "audit_results":       None,
         "audit_data_count":    0,
+        # Payment Packager state
+        "payment_result":       None,
+        "payment_batches":      [],   # [{"label", "files": [{"name", "bytes"}]}]
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1247,12 +1250,13 @@ st.markdown("""
 <p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_pay, tab_db, tab_cfg = st.tabs([
     "✂️  Invoice Splitter",
     "🔗  Invoice Matcher",
     "🏷️  Invoice Coding",
     "📊  Couru Code",
     "🔍  AP Audit",
+    "💳  Payment Packager",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -2219,7 +2223,316 @@ with tab_audit:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — DATABASE
+# TAB 6 — PAYMENT PACKAGER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_pay:
+    st.subheader("💳 Payment Packager — Build the invoice packages for a payment run")
+    st.markdown(
+        "This tool works entirely through **upload / download** — it does **not** need access "
+        "to your computer's folders or network drives, so it works from any browser without "
+        "installing anything. Invoices are matched by **invoice number**: the first **8 "
+        "characters** of each PDF's filename, against the **Reference** column (column **E**) "
+        "of the AP payment report.\n\n"
+        "1. Upload the **payment report** (Excel/CSV) — the list of invoices to pay.\n"
+        "2. Add each **unpaid folder** separately (its name/vendor + all its current PDFs, "
+        "paid or not) — one folder at a time, as many as you need.\n"
+        "3. Click **Build payment packages** — you'll get a ZIP for the **Paid folder (AP / "
+        "Vendors)**, a ZIP for the **payment-number folder (Finance)**, and — for each unpaid "
+        "folder you added — a ready-to-swap-in **updated unpaid ZIP** with the paid invoices "
+        "already removed, so you replace the whole folder instead of hunting files to delete."
+    )
+
+    def _pay_clean_ref(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return ""
+        if re.fullmatch(r"\d+\.0+", s):
+            s = s.split(".")[0]
+        return s
+
+    # ── 1. Payment report ────────────────────────────────────────────────────
+    st.markdown("**1. Payment report (invoices to pay)**")
+    pay_list_file = st.file_uploader(
+        "Excel or CSV with the invoices selected for payment",
+        type=["xlsx", "xls", "csv"],
+        key="pay_list_upload",
+    )
+
+    pay_invoices = []
+    if pay_list_file:
+        df_pay = None
+        try:
+            if pay_list_file.name.lower().endswith(".csv"):
+                df_pay = pd.read_csv(pay_list_file)
+            else:
+                df_pay = pd.read_excel(pay_list_file)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+
+        if df_pay is not None and len(df_pay.columns):
+            guess_idx = 4 if len(df_pay.columns) > 4 else 0
+            for i, c in enumerate(df_pay.columns):
+                if re.search(r"reference|referencia|factura|invoice", str(c), re.I):
+                    guess_idx = i
+                    break
+            pay_col = st.selectbox(
+                "Column with the invoice number (defaults to column E — Reference)",
+                options=list(df_pay.columns),
+                index=guess_idx,
+                key="pay_col_select",
+            )
+            st.caption(
+                "Compared against the first 8 characters of each PDF's filename — "
+                "e.g. `92006209_ML_24289954.pdf` → `92006209`."
+            )
+            pay_invoices = [
+                _pay_clean_ref(v) for v in df_pay[pay_col].tolist()
+            ]
+            pay_invoices = [v for v in pay_invoices if v]
+            st.caption(f"{len(pay_invoices)} invoice(s) loaded from **{pay_col}**")
+
+    st.divider()
+
+    # ── 2. Unpaid folders, added one at a time ──────────────────────────────
+    st.markdown("**2. Unpaid folders**")
+    st.caption(
+        "Add every unpaid folder that might contain a selected invoice. Upload **all** the PDFs "
+        "currently in that folder (not just the ones being paid) so the tool can hand back a "
+        "complete, ready-to-swap-in replacement for it."
+    )
+
+    existing_labels = {b["label"].lower() for b in st.session_state.payment_batches}
+    with st.form("pay_add_batch_form", clear_on_submit=True):
+        fc1, fc2 = st.columns([1, 2])
+        with fc1:
+            batch_label = st.text_input("Folder name / vendor No.", placeholder="0101000430")
+        with fc2:
+            batch_files = st.file_uploader(
+                "All PDFs currently in that folder", type=["pdf"], accept_multiple_files=True,
+            )
+        add_batch = st.form_submit_button("➕ Add this folder")
+
+    if add_batch:
+        label = batch_label.strip()
+        if not label:
+            st.warning("Enter a folder name / vendor number first.")
+        elif label.lower() in existing_labels:
+            st.warning(f"'{label}' was already added — remove it below first if you want to replace it.")
+        elif not batch_files:
+            st.warning("Upload that folder's PDFs first.")
+        else:
+            st.session_state.payment_batches.append({
+                "label": label,
+                "files": [{"name": f.name, "bytes": f.getvalue()} for f in batch_files],
+            })
+            st.rerun()
+
+    if st.session_state.payment_batches:
+        for i, b in enumerate(st.session_state.payment_batches):
+            bc1, bc2 = st.columns([6, 1])
+            with bc1:
+                st.write(f"📁 **{b['label']}** — {len(b['files'])} file(s)")
+            with bc2:
+                if st.button("🗑️", key=f"pay_batch_del_{i}"):
+                    st.session_state.payment_batches.pop(i)
+                    st.rerun()
+    else:
+        st.info("No unpaid folders added yet.")
+
+    st.divider()
+
+    # ── 3. Payment number ─────────────────────────────────────────────────────
+    st.markdown("**3. Payment number**")
+    payment_no_txt = st.text_input(
+        "Used to name the Finance package/folder",
+        value="",
+        placeholder="e.g. PAY-2026-08-17-001",
+        key="pay_number_input",
+    )
+
+    st.divider()
+
+    can_build = bool(pay_invoices and st.session_state.payment_batches and payment_no_txt.strip())
+    if st.button("📦 Build payment packages", type="primary", disabled=not can_build):
+        # Index every uploaded file across all folders, by invoice No. (first 8 chars of filename).
+        upload_index = {}
+        for b in st.session_state.payment_batches:
+            for f in b["files"]:
+                inv_key = f["name"][:8]
+                upload_index.setdefault(inv_key, []).append(f)
+
+        rows = []
+        for inv_no in pay_invoices:
+            matches = upload_index.get(inv_no, [])
+            if len(matches) == 1:
+                status = "found"
+            elif len(matches) > 1:
+                status = "duplicate"
+            else:
+                status = "not_found"
+            rows.append({"invoice_no": inv_no, "matches": matches, "status": status})
+
+        to_pack = [r for r in rows if r["status"] == "found"]
+        paid_keys = {r["invoice_no"] for r in to_pack}
+
+        zip_paid_buf = BytesIO()
+        with zipfile.ZipFile(zip_paid_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in to_pack:
+                zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
+        zip_paid_buf.seek(0)
+
+        zip_finance_buf = BytesIO()
+        with zipfile.ZipFile(zip_finance_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in to_pack:
+                zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
+        zip_finance_buf.seek(0)
+
+        # One "updated unpaid" ZIP per folder — everything except what just got paid.
+        remaining_zips = []
+        for b in st.session_state.payment_batches:
+            remaining = [f for f in b["files"] if f["name"][:8] not in paid_keys]
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in remaining:
+                    zf.writestr(f["name"], f["bytes"])
+            buf.seek(0)
+            remaining_zips.append({
+                "label": b["label"],
+                "zip": buf.getvalue(),
+                "removed": len(b["files"]) - len(remaining),
+                "remaining": len(remaining),
+            })
+
+        report_rows = [{
+            "Invoice No":    r["invoice_no"],
+            "File":          r["matches"][0]["name"] if len(r["matches"]) == 1 else
+                              "; ".join(m["name"] for m in r["matches"]) if r["matches"] else "",
+            "Status": {"found": "Packaged", "duplicate": "Duplicate — review",
+                       "not_found": "Not found"}[r["status"]],
+        } for r in rows]
+        buf_report = BytesIO()
+        with pd.ExcelWriter(buf_report, engine="openpyxl") as xl_writer:
+            pd.DataFrame(report_rows).to_excel(xl_writer, index=False)
+        buf_report.seek(0)
+
+        st.session_state.payment_result = {
+            "payment_no":     payment_no_txt.strip(),
+            "rows":           [{
+                "invoice_no": r["invoice_no"],
+                "status":     r["status"],
+                "files":      [m["name"] for m in r["matches"]],
+            } for r in rows],
+            "zip_paid":       zip_paid_buf.getvalue(),
+            "zip_finance":    zip_finance_buf.getvalue(),
+            "report_xlsx":    buf_report.getvalue(),
+            "remaining_zips": remaining_zips,
+        }
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    result = st.session_state.get("payment_result")
+    if result:
+        rows        = result["rows"]
+        n_found     = sum(1 for r in rows if r["status"] == "found")
+        n_dup       = sum(1 for r in rows if r["status"] == "duplicate")
+        n_not_found = sum(1 for r in rows if r["status"] == "not_found")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num blue'>{len(rows)}</div>"
+                f"<div class='stat-lbl'>Selected</div></div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num green'>{n_found}</div>"
+                f"<div class='stat-lbl'>Packaged</div></div>", unsafe_allow_html=True)
+        with c3:
+            col_c = "amber" if n_dup else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_dup}</div>"
+                f"<div class='stat-lbl'>Duplicate — review</div></div>", unsafe_allow_html=True)
+        with c4:
+            col_c = "red" if n_not_found else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_not_found}</div>"
+                f"<div class='stat-lbl'>Not found</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        _pay_status_lbl = {"found": "✅ Packaged", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
+        df_preview = pd.DataFrame([{
+            "Invoice No": r["invoice_no"],
+            "File(s)":    "; ".join(r["files"]) if r["files"] else "—",
+            "Status":     _pay_status_lbl[r["status"]],
+        } for r in rows])
+        st.dataframe(df_preview, use_container_width=True, hide_index=True)
+
+        if n_dup:
+            st.warning(
+                "⚠️ Some invoice numbers matched more than one uploaded PDF (same first 8 "
+                "characters, possibly in different folders) — those are skipped automatically "
+                "(in both the paid package and every 'updated unpaid' ZIP) so the wrong file "
+                "isn't moved. Resolve them manually, then rebuild."
+            )
+        if n_not_found:
+            st.info(
+                "ℹ️ Invoice numbers marked **Not found** weren't among the uploaded PDFs — check "
+                "the number or upload the right folder and build the packages again."
+            )
+
+        if n_found:
+            st.success(f"✅ {n_found} invoice(s) packaged.")
+            dcol1, dcol2, dcol3 = st.columns(3)
+            with dcol1:
+                st.download_button(
+                    "⬇️ Paid folder ZIP (AP / Vendors)",
+                    data=result["zip_paid"],
+                    file_name=f"facturas_pagadas_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with dcol2:
+                st.download_button(
+                    "⬇️ Finance ZIP (payment " + result["payment_no"] + ")",
+                    data=result["zip_finance"],
+                    file_name=f"pago_{result['payment_no']}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with dcol3:
+                st.download_button(
+                    "⬇️ Checklist (Excel)",
+                    data=result["report_xlsx"],
+                    file_name=f"payment_checklist_{result['payment_no']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("**📁 Updated unpaid folders — replace each folder's contents with its ZIP**")
+            for rz in result["remaining_zips"]:
+                safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", rz["label"])
+                st.download_button(
+                    f"⬇️ Unpaid — {rz['label']}  ({rz['removed']} removed, {rz['remaining']} remaining)",
+                    data=rz["zip"],
+                    file_name=f"unpaid_{safe_label}_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    key=f"pay_remaining_dl_{safe_label}",
+                    use_container_width=True,
+                )
+
+            st.info(
+                "💡 **Next steps:** unzip the Paid ZIP into your **AP / Vendors paid** folder, "
+                "unzip the Finance ZIP into the **payment-number** folder, then for each unpaid "
+                "folder listed above, **delete everything inside it and unzip its updated ZIP in "
+                "its place** — no need to search for and delete individual files."
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_db:
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
@@ -2333,7 +2646,7 @@ with tab_db:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — SETTINGS
+# TAB 8 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cfg:
     st.subheader("General Settings")
