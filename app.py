@@ -14,6 +14,9 @@ import zipfile
 import re
 import copy
 import json
+import os
+import shutil
+from pathlib import Path
 import pandas as pd
 from datetime import date, datetime, timedelta
 import openpyxl
@@ -114,6 +117,14 @@ def init_state():
         # AP Audit state
         "audit_results":       None,
         "audit_data_count":    0,
+        # Payment Mover state
+        "payment_unpaid_paths":  "",
+        "payment_paid_folder":   "",
+        "payment_finance_base":  "",
+        "payment_recursive":     True,
+        "payment_overwrite":     False,
+        "payment_preview":       None,
+        "payment_move_log":      None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1181,12 +1192,13 @@ st.markdown("""
 <p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
 """, unsafe_allow_html=True)
 
-tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_db, tab_cfg = st.tabs([
+tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_pay, tab_db, tab_cfg = st.tabs([
     "✂️  Invoice Splitter",
     "🔗  Invoice Matcher",
     "🏷️  Invoice Coding",
     "📊  Couru Code",
     "🔍  AP Audit",
+    "💳  Payment Mover",
     "🗄️  Database",
     "⚙️  Settings",
 ])
@@ -2153,7 +2165,289 @@ with tab_audit:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — DATABASE
+# TAB 6 — PAYMENT MOVER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_pay:
+    st.subheader("💳 Payment Mover — Move Selected Invoices to Payment Folders")
+    st.markdown(
+        "Upload the **Excel/CSV** listing the invoice filenames selected for this payment run. "
+        "The tool searches one or more **unpaid** folders (recursively), then **copies each "
+        "matched invoice** into the **AP / Vendors paid folder** and into a **Finance folder "
+        "named after the payment number** — the original is removed from the unpaid folder only "
+        "after both copies succeed."
+    )
+    st.warning(
+        "⚠️ This only works when the app runs **locally** (or on a server) with direct access to "
+        "the folder paths below — e.g. mapped network drives. It will **not** work on a "
+        "browser-only / cloud-hosted deployment with no filesystem access."
+    )
+
+    # ── 1. Selected invoices file ────────────────────────────────────────────
+    st.markdown("**1. Selected invoices file**")
+    pay_list_file = st.file_uploader(
+        "Excel or CSV with the filenames selected for payment",
+        type=["xlsx", "xls", "csv"],
+        key="pay_list_upload",
+    )
+
+    pay_filenames = []
+    if pay_list_file:
+        df_pay = None
+        try:
+            if pay_list_file.name.lower().endswith(".csv"):
+                df_pay = pd.read_csv(pay_list_file)
+            else:
+                df_pay = pd.read_excel(pay_list_file)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+
+        if df_pay is not None and len(df_pay.columns):
+            guess_idx = 0
+            for i, c in enumerate(df_pay.columns):
+                if re.search(r"archivo|file|factura|nombre|name", str(c), re.I):
+                    guess_idx = i
+                    break
+            pay_col = st.selectbox(
+                "Column with the invoice filename",
+                options=list(df_pay.columns),
+                index=guess_idx,
+                key="pay_col_select",
+            )
+            st.caption("Values must match the file name exactly, including the extension (e.g. `.pdf`).")
+            pay_filenames = [
+                str(v).strip() for v in df_pay[pay_col].tolist()
+                if v is not None and str(v).strip() and str(v).strip().lower() != "nan"
+            ]
+            st.caption(f"{len(pay_filenames)} filename(s) loaded from **{pay_col}**")
+
+    st.divider()
+
+    # ── 2. Source / destination folders ──────────────────────────────────────
+    st.markdown("**2. Folders**")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        unpaid_paths_txt = st.text_area(
+            "Unpaid folder(s) — one path per line",
+            value=st.session_state.payment_unpaid_paths,
+            height=100,
+            placeholder="\\\\server\\share\\Unpaid\\Vendor0101000430\n\\\\server\\share\\Unpaid\\Vendor0101002430",
+            key="pay_unpaid_paths_input",
+        )
+        pay_recursive = st.checkbox(
+            "Search subfolders recursively",
+            value=st.session_state.payment_recursive,
+            key="pay_recursive_input",
+        )
+    with col_b:
+        paid_folder_txt = st.text_input(
+            "Paid invoices folder (AP / Vendors)",
+            value=st.session_state.payment_paid_folder,
+            key="pay_paid_folder_input",
+        )
+        finance_base_txt = st.text_input(
+            "Finance base folder (a subfolder named with the payment number is created here)",
+            value=st.session_state.payment_finance_base,
+            key="pay_finance_base_input",
+        )
+        payment_no_txt = st.text_input(
+            "Payment number",
+            value="",
+            placeholder="e.g. PAY-2026-08-17-001",
+            key="pay_number_input",
+        )
+        pay_overwrite = st.checkbox(
+            "Overwrite if the file already exists at destination",
+            value=st.session_state.payment_overwrite,
+            key="pay_overwrite_input",
+        )
+
+    # persist folder settings for convenience across reruns
+    st.session_state.payment_unpaid_paths = unpaid_paths_txt
+    st.session_state.payment_paid_folder  = paid_folder_txt
+    st.session_state.payment_finance_base = finance_base_txt
+    st.session_state.payment_recursive    = pay_recursive
+    st.session_state.payment_overwrite    = pay_overwrite
+
+    st.divider()
+
+    # ── 3. Preview ────────────────────────────────────────────────────────────
+    do_preview = st.button(
+        "🔍 Preview matches",
+        type="primary",
+        disabled=not (pay_filenames and unpaid_paths_txt.strip()),
+    )
+
+    if do_preview:
+        roots = [p.strip() for p in unpaid_paths_txt.splitlines() if p.strip()]
+        index = {}  # lower(filename) -> [Path, ...]
+        bad_roots = []
+        for root in roots:
+            root_path = Path(root)
+            if not root_path.is_dir():
+                bad_roots.append(root)
+                continue
+            if pay_recursive:
+                walker = os.walk(root_path)
+            else:
+                walker = [(str(root_path), [], [f.name for f in root_path.iterdir() if f.is_file()])]
+            for dirpath, _dirnames, filenames in walker:
+                for fn in filenames:
+                    index.setdefault(fn.lower(), []).append(Path(dirpath) / fn)
+
+        if bad_roots:
+            st.error(
+                "The following folder(s) don't exist or aren't accessible:\n"
+                + "\n".join(f"- {b}" for b in bad_roots)
+            )
+
+        preview_rows = []
+        for name in pay_filenames:
+            matches = index.get(name.lower(), [])
+            if len(matches) == 1:
+                status = "found"
+            elif len(matches) > 1:
+                status = "duplicate"
+            else:
+                status = "not_found"
+            preview_rows.append({
+                "filename": name,
+                "matches": [str(m) for m in matches],
+                "status": status,
+            })
+        st.session_state.payment_preview  = preview_rows
+        st.session_state.payment_move_log = None
+
+    # ── Preview results ───────────────────────────────────────────────────────
+    if st.session_state.payment_preview:
+        pay_rows    = st.session_state.payment_preview
+        n_found     = sum(1 for r in pay_rows if r["status"] == "found")
+        n_dup       = sum(1 for r in pay_rows if r["status"] == "duplicate")
+        n_not_found = sum(1 for r in pay_rows if r["status"] == "not_found")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num blue'>{len(pay_rows)}</div>"
+                f"<div class='stat-lbl'>Selected</div></div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num green'>{n_found}</div>"
+                f"<div class='stat-lbl'>Ready to move</div></div>", unsafe_allow_html=True)
+        with c3:
+            col_c = "amber" if n_dup else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_dup}</div>"
+                f"<div class='stat-lbl'>Duplicate — review</div></div>", unsafe_allow_html=True)
+        with c4:
+            col_c = "red" if n_not_found else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_not_found}</div>"
+                f"<div class='stat-lbl'>Not found</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        _pay_status_lbl = {"found": "✅ Ready", "duplicate": "⚠️ Duplicate", "not_found": "❌ Not found"}
+        df_preview = pd.DataFrame([{
+            "File":         r["filename"],
+            "Status":       _pay_status_lbl[r["status"]],
+            "Location(s)":  "\n".join(r["matches"]) if r["matches"] else "—",
+        } for r in pay_rows])
+        st.dataframe(df_preview, use_container_width=True, hide_index=True)
+
+        if n_dup:
+            st.warning(
+                "⚠️ Duplicate filenames were found in more than one unpaid folder — these are "
+                "skipped automatically. Resolve them manually, then re-run the preview."
+            )
+        if n_not_found:
+            st.info("ℹ️ Files marked **Not found** are skipped — check the filename or the folder paths.")
+
+        # ── 4. Move ───────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("**3. Move**")
+        pay_confirm = st.checkbox(
+            f"I confirm I want to move **{n_found}** invoice(s) out of the unpaid folder(s) into "
+            f"the Paid and Finance folders.",
+            key="pay_confirm_move",
+        )
+        pay_dest_ready = bool(paid_folder_txt.strip() and finance_base_txt.strip() and payment_no_txt.strip())
+        can_move = pay_confirm and n_found > 0 and pay_dest_ready
+        if n_found and not pay_dest_ready:
+            st.info("ℹ️ Fill in the Paid folder, Finance base folder and Payment number to enable the move.")
+
+        if st.button("📦 Move invoices now", type="primary", disabled=not can_move):
+            paid_dir    = Path(paid_folder_txt.strip())
+            finance_dir = Path(finance_base_txt.strip()) / payment_no_txt.strip()
+            try:
+                paid_dir.mkdir(parents=True, exist_ok=True)
+                finance_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                st.error(f"Could not create destination folder(s): {e}")
+                st.stop()
+
+            move_log = []
+            to_move  = [r for r in pay_rows if r["status"] == "found"]
+            prog = st.progress(0, text="Moving…")
+            for i, r in enumerate(to_move):
+                prog.progress(i / max(len(to_move), 1), text=f"Moving {r['filename']}…")
+                src          = Path(r["matches"][0])
+                dest_paid    = paid_dir / src.name
+                dest_finance = finance_dir / src.name
+                entry = {
+                    "filename":     src.name,
+                    "source":       str(src),
+                    "paid_dest":    str(dest_paid),
+                    "finance_dest": str(dest_finance),
+                    "status":       "",
+                    "detail":       "",
+                }
+                try:
+                    if not pay_overwrite and (dest_paid.exists() or dest_finance.exists()):
+                        entry["status"] = "skipped"
+                        entry["detail"] = "Already exists at destination"
+                    else:
+                        shutil.copy2(src, dest_paid)
+                        shutil.copy2(src, dest_finance)
+                        os.remove(src)
+                        entry["status"] = "moved"
+                except Exception as e:
+                    entry["status"] = "error"
+                    entry["detail"] = str(e)
+                move_log.append(entry)
+            prog.progress(1.0, text="✅ Done")
+            st.session_state.payment_move_log = move_log
+            st.rerun()
+
+    # ── Move results / log ───────────────────────────────────────────────────
+    if st.session_state.payment_move_log:
+        move_log  = st.session_state.payment_move_log
+        n_moved   = sum(1 for e in move_log if e["status"] == "moved")
+        n_skipped = sum(1 for e in move_log if e["status"] == "skipped")
+        n_error   = sum(1 for e in move_log if e["status"] == "error")
+
+        if n_error:
+            st.error(f"⚠️ {n_moved} moved, {n_skipped} skipped, {n_error} error(s) — see the log below.")
+        elif n_skipped:
+            st.warning(f"✅ {n_moved} moved, {n_skipped} skipped (already existed at destination).")
+        else:
+            st.success(f"✅ {n_moved} invoice(s) moved to the Paid and Finance folders.")
+
+        df_log = pd.DataFrame(move_log)
+        st.dataframe(df_log, use_container_width=True, hide_index=True)
+
+        buf_log = BytesIO()
+        with pd.ExcelWriter(buf_log, engine="openpyxl") as xl_writer:
+            df_log.to_excel(xl_writer, index=False)
+        buf_log.seek(0)
+        st.download_button(
+            "⬇️ Download move log (Excel)",
+            data=buf_log.read(),
+            file_name=f"payment_move_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_db:
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
@@ -2267,7 +2561,7 @@ with tab_db:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — SETTINGS
+# TAB 8 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cfg:
     st.subheader("General Settings")
