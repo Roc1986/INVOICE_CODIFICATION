@@ -116,6 +116,7 @@ def init_state():
         "audit_data_count":    0,
         # Payment Packager state
         "payment_result":       None,
+        "payment_batches":      [],   # [{"label", "files": [{"name", "bytes"}]}]
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2165,13 +2166,12 @@ with tab_pay:
         "to your computer's folders or network drives, so it works from any browser without "
         "installing anything.\n\n"
         "1. Upload the **Excel/CSV** with the filenames selected for this payment.\n"
-        "2. Upload the **invoice PDFs** — select all the files from an unpaid folder at once "
-        "(e.g. `Ctrl+A` in the file picker); if the invoices are spread across several unpaid "
-        "folders, click **Browse files** again for each extra folder — everything you add stays "
-        "in the list.\n"
-        "3. Click **Build payment packages** — you'll get two ZIP files ready to drop into the "
-        "**Paid folder (AP / Vendors)** and the **payment-number folder (Finance)**, plus a "
-        "checklist to know exactly which files to remove from the unpaid folder(s)."
+        "2. Add each **unpaid folder** separately (its name/vendor + all its current PDFs) — "
+        "one folder at a time, as many as you need.\n"
+        "3. Click **Build payment packages** — you'll get a ZIP for the **Paid folder (AP / "
+        "Vendors)**, a ZIP for the **payment-number folder (Finance)**, and — for each unpaid "
+        "folder you added — a ready-to-swap-in **updated unpaid ZIP** with the paid invoices "
+        "already removed, so you replace the whole folder instead of hunting files to delete."
     )
 
     # ── 1. Selected invoices file ────────────────────────────────────────────
@@ -2214,16 +2214,51 @@ with tab_pay:
 
     st.divider()
 
-    # ── 2. Invoice files ──────────────────────────────────────────────────────
-    st.markdown("**2. Invoice files (from one or more unpaid folders)**")
-    pay_invoice_uploads = st.file_uploader(
-        "Select all the invoice PDFs — add more from other folders as needed",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pay_invoice_upload",
+    # ── 2. Unpaid folders, added one at a time ──────────────────────────────
+    st.markdown("**2. Unpaid folders**")
+    st.caption(
+        "Add every unpaid folder that might contain a selected invoice. Upload **all** the PDFs "
+        "currently in that folder (not just the ones being paid) so the tool can hand back a "
+        "complete, ready-to-swap-in replacement for it."
     )
-    if pay_invoice_uploads:
-        st.caption(f"{len(pay_invoice_uploads)} file(s) uploaded so far")
+
+    existing_labels = {b["label"].lower() for b in st.session_state.payment_batches}
+    with st.form("pay_add_batch_form", clear_on_submit=True):
+        fc1, fc2 = st.columns([1, 2])
+        with fc1:
+            batch_label = st.text_input("Folder name / vendor No.", placeholder="0101000430")
+        with fc2:
+            batch_files = st.file_uploader(
+                "All PDFs currently in that folder", type=["pdf"], accept_multiple_files=True,
+            )
+        add_batch = st.form_submit_button("➕ Add this folder")
+
+    if add_batch:
+        label = batch_label.strip()
+        if not label:
+            st.warning("Enter a folder name / vendor number first.")
+        elif label.lower() in existing_labels:
+            st.warning(f"'{label}' was already added — remove it below first if you want to replace it.")
+        elif not batch_files:
+            st.warning("Upload that folder's PDFs first.")
+        else:
+            st.session_state.payment_batches.append({
+                "label": label,
+                "files": [{"name": f.name, "bytes": f.getvalue()} for f in batch_files],
+            })
+            st.rerun()
+
+    if st.session_state.payment_batches:
+        for i, b in enumerate(st.session_state.payment_batches):
+            bc1, bc2 = st.columns([6, 1])
+            with bc1:
+                st.write(f"📁 **{b['label']}** — {len(b['files'])} file(s)")
+            with bc2:
+                if st.button("🗑️", key=f"pay_batch_del_{i}"):
+                    st.session_state.payment_batches.pop(i)
+                    st.rerun()
+    else:
+        st.info("No unpaid folders added yet.")
 
     st.divider()
 
@@ -2238,12 +2273,13 @@ with tab_pay:
 
     st.divider()
 
-    can_build = bool(pay_filenames and pay_invoice_uploads and payment_no_txt.strip())
+    can_build = bool(pay_filenames and st.session_state.payment_batches and payment_no_txt.strip())
     if st.button("📦 Build payment packages", type="primary", disabled=not can_build):
-        # Index uploaded files by lowercase filename, flagging duplicates.
+        # Index every uploaded file across all folders, by lowercase filename.
         upload_index = {}
-        for uf in pay_invoice_uploads:
-            upload_index.setdefault(uf.name.lower(), []).append(uf)
+        for b in st.session_state.payment_batches:
+            for f in b["files"]:
+                upload_index.setdefault(f["name"].lower(), []).append(f)
 
         rows = []
         for name in pay_filenames:
@@ -2257,18 +2293,35 @@ with tab_pay:
             rows.append({"filename": name, "matches": matches, "status": status})
 
         to_pack = [r for r in rows if r["status"] == "found"]
+        paid_names_lower = {r["matches"][0]["name"].lower() for r in to_pack}
 
         zip_paid_buf = BytesIO()
         with zipfile.ZipFile(zip_paid_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for r in to_pack:
-                zf.writestr(r["matches"][0].name, r["matches"][0].getvalue())
+                zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
         zip_paid_buf.seek(0)
 
         zip_finance_buf = BytesIO()
         with zipfile.ZipFile(zip_finance_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for r in to_pack:
-                zf.writestr(r["matches"][0].name, r["matches"][0].getvalue())
+                zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
         zip_finance_buf.seek(0)
+
+        # One "updated unpaid" ZIP per folder — everything except what just got paid.
+        remaining_zips = []
+        for b in st.session_state.payment_batches:
+            remaining = [f for f in b["files"] if f["name"].lower() not in paid_names_lower]
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in remaining:
+                    zf.writestr(f["name"], f["bytes"])
+            buf.seek(0)
+            remaining_zips.append({
+                "label": b["label"],
+                "zip": buf.getvalue(),
+                "removed": len(b["files"]) - len(remaining),
+                "remaining": len(remaining),
+            })
 
         report_rows = [{
             "File": r["filename"],
@@ -2281,11 +2334,12 @@ with tab_pay:
         buf_report.seek(0)
 
         st.session_state.payment_result = {
-            "payment_no":   payment_no_txt.strip(),
-            "rows":         [{"filename": r["filename"], "status": r["status"]} for r in rows],
-            "zip_paid":     zip_paid_buf.getvalue(),
-            "zip_finance":  zip_finance_buf.getvalue(),
-            "report_xlsx":  buf_report.getvalue(),
+            "payment_no":     payment_no_txt.strip(),
+            "rows":           [{"filename": r["filename"], "status": r["status"]} for r in rows],
+            "zip_paid":       zip_paid_buf.getvalue(),
+            "zip_finance":    zip_finance_buf.getvalue(),
+            "report_xlsx":    buf_report.getvalue(),
+            "remaining_zips": remaining_zips,
         }
 
     # ── Results ───────────────────────────────────────────────────────────────
@@ -2325,17 +2379,18 @@ with tab_pay:
 
         if n_dup:
             st.warning(
-                "⚠️ Some uploaded files share the same name — those are skipped automatically "
-                "so the wrong file isn't packaged. Remove the extra copy and re-upload."
+                "⚠️ Some uploaded files share the same name across folders — those are skipped "
+                "automatically (in both the paid package and every 'updated unpaid' ZIP) so the "
+                "wrong file isn't moved. Resolve them manually, then rebuild."
             )
         if n_not_found:
             st.info(
                 "ℹ️ Files marked **Not found** weren't among the uploaded PDFs — check the "
-                "filename or upload them and build the packages again."
+                "filename or upload the right folder and build the packages again."
             )
 
         if n_found:
-            st.success(f"✅ {n_found} invoice(s) packaged into two ZIP files.")
+            st.success(f"✅ {n_found} invoice(s) packaged.")
             dcol1, dcol2, dcol3 = st.columns(3)
             with dcol1:
                 st.download_button(
@@ -2361,10 +2416,25 @@ with tab_pay:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("**📁 Updated unpaid folders — replace each folder's contents with its ZIP**")
+            for rz in result["remaining_zips"]:
+                safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", rz["label"])
+                st.download_button(
+                    f"⬇️ Unpaid — {rz['label']}  ({rz['removed']} removed, {rz['remaining']} remaining)",
+                    data=rz["zip"],
+                    file_name=f"unpaid_{safe_label}_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    key=f"pay_remaining_dl_{safe_label}",
+                    use_container_width=True,
+                )
+
             st.info(
-                "💡 **Next steps:** unzip the first file into your **Paid (AP)** folder, unzip the "
-                "second into the **Finance / payment-number** folder, then use the checklist to "
-                "delete the packaged files from the unpaid folder(s)."
+                "💡 **Next steps:** unzip the Paid ZIP into your **AP / Vendors paid** folder, "
+                "unzip the Finance ZIP into the **payment-number** folder, then for each unpaid "
+                "folder listed above, **delete everything inside it and unzip its updated ZIP in "
+                "its place** — no need to search for and delete individual files."
             )
 
 
