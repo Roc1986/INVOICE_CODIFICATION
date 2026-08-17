@@ -815,7 +815,8 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
     All pages are merged into a single coordinate space (y-offset per page)
     so invoice blocks that span a page boundary are handled correctly.
     Each block runs from [APINV_y, next_APINV_y) — no cross-invoice contamination.
-    Date search is limited to yk-5..yk+35 (APINV row + due-date row only).
+    Invoice date = date on the same line as the APINV/invoice-number row;
+    due date = the next date found in the rows below it (yk+6..yk+45).
     Total is located by the 'Total:' label; falls back to max amount in block.
     """
     records = {}
@@ -838,18 +839,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 return _parse_date_str(t)
         return None
 
-    def _assign_dates(date_items: list):
-        if not date_items:
-            return None, None
-        date_items.sort(key=lambda x: x[0])
-        dates = [d for _, d in date_items]
-        if len(dates) == 1:
-            d = dates[0]
-            return (None, d) if d.day in (15, 30) else (d, None)
-        inv, due = dates[0], dates[1]
-        if inv.day in (15, 30) and due.day not in (15, 30):
-            inv, due = due, inv
-        return inv, due
+    def _row_date(ys: list) -> "date | None":
+        """First date word found scanning the given rows top-to-bottom."""
+        for y in ys:
+            for w in sorted(row_map.get(y, []), key=lambda w: w["x0"]):
+                d = _is_date_word(w["text"])
+                if d:
+                    return d
+        return None
 
     try:
         # ── Merge all pages into one coordinate space ────────────────────────────
@@ -947,19 +944,15 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                     cc = mc.group(1).upper()
                     break
 
-            # Dates: APINV row ±15 above + 45 below.
-            # Crystal Reports can place the date column up to ~12 pt above or
-            # below the "APINV" text baseline; +45 captures the due-date line
-            # even with generous line spacing.  ISO dates are specific enough
-            # (YYYY-MM-DD) that false positives from sub-rows are not a risk.
-            date_band_ys = [y for y in sorted_ys if yk - 15 <= y <= yk + 45]
-            date_items: list = []
-            for y in date_band_ys:
-                for w in row_map.get(y, []):
-                    d = _is_date_word(w["text"])
-                    if d:
-                        date_items.append((w["top"], d))
-            inv_date, due_date = _assign_dates(date_items)
+            # Invoice date: the date printed ON THE SAME LINE as the APINV /
+            # invoice-number row (±6 pt — Crystal Reports row tolerance).
+            # Due date: the next date word in the following rows within the
+            # block (it sits directly under the invoice date, one line down).
+            same_row_ys = [y for y in sorted_ys if abs(y - yk) <= 6]
+            inv_date = _row_date(same_row_ys)
+
+            below_ys = [y for y in sorted_ys if yk + 6 < y <= yk + 45]
+            due_date = _row_date(below_ys)
 
             # Total: find the 'Total:' label row (not Sub-Total / Sous-Total)
             total_amt = None
