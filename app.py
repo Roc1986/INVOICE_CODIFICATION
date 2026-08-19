@@ -2310,6 +2310,20 @@ with tab_pay:
 
     existing_labels = {b["label"].lower() for b in st.session_state.payment_batches}
     _pay_form_key = st.session_state.payment_batch_form_key
+
+    if st.session_state.payment_batches:
+        _pay_total_mb = sum(
+            len(f["bytes"]) for b in st.session_state.payment_batches for f in b["files"]
+        ) / (1024 * 1024)
+        cap_col, clr_col = st.columns([5, 1])
+        with cap_col:
+            st.caption(f"📦 {_pay_total_mb:,.1f} MB currently held in this session across all folders.")
+        with clr_col:
+            if st.button("🗑️ Clear all", key="pay_clear_all", use_container_width=True):
+                st.session_state.payment_batches = []
+                st.session_state.payment_result = None
+                st.rerun()
+
     fc1, fc2 = st.columns([1, 2])
     with fc1:
         batch_label = st.text_input(
@@ -2388,17 +2402,13 @@ with tab_pay:
         to_pack = [r for r in rows if r["status"] == "found"]
         paid_keys = {r["invoice_no"] for r in to_pack}
 
+        # Paid and Finance folders get the exact same set of files — build the
+        # ZIP once and reuse its bytes for both instead of duplicating it in memory.
         zip_paid_buf = BytesIO()
         with zipfile.ZipFile(zip_paid_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for r in to_pack:
                 zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
-        zip_paid_buf.seek(0)
-
-        zip_finance_buf = BytesIO()
-        with zipfile.ZipFile(zip_finance_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for r in to_pack:
-                zf.writestr(r["matches"][0]["name"], r["matches"][0]["bytes"])
-        zip_finance_buf.seek(0)
+        zip_paid_bytes = zip_paid_buf.getvalue()
 
         payment_no_clean = payment_no_txt.strip()
 
@@ -2453,8 +2463,8 @@ with tab_pay:
                 "status":     r["status"],
                 "files":      [m["name"] for m in r["matches"]],
             } for r in rows],
-            "zip_paid":       zip_paid_buf.getvalue(),
-            "zip_finance":    zip_finance_buf.getvalue(),
+            "zip_paid":       zip_paid_bytes,
+            "zip_finance":    zip_paid_bytes,
             "report_xlsx":    buf_report.getvalue(),
             "remaining_zips": remaining_zips,
             "zip_all":        zip_all_buf.getvalue(),
