@@ -1356,6 +1356,67 @@ def parse_bourret_statement(filename: str, file_bytes: bytes) -> tuple:
     raise ValueError("Only PDF statements are supported for Transport Bourret right now.")
 
 
+def parse_proden_statement_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Parse a Les Entreprises Proden 'État de compte' aging PDF.
+    Each line looks like:
+      Apr-20-26 305912 MLQD82865 87 / 117 4,799.06
+    (invoice date, invoice #, PO#, a "days overdue / days since invoice"
+    pair we don't need, and the outstanding amount). The amount is printed
+    in whichever of the four aging-bucket columns applies (Courant / 31-60
+    / 61-90 / >90 jours), so exactly one amount value appears per line no
+    matter which bucket it's in — we don't need to track which column it
+    came from for reconciliation purposes.
+    The footer totals row has 5 numbers: a grand total followed by the four
+    bucket subtotals; the grand total is used for the statement-total
+    sanity check.
+    """
+    records = []
+    grand_total = None
+    line_pat = re.compile(
+        r'^([A-Za-z]{3}-\d{2}-\d{2})\s+(\d{5,7})\s+(\S+)\s+\d+\s*/\s*\d+\s+([\d,]+\.\d{2})\s*$'
+    )
+    total_pat = re.compile(
+        r'^([\d,]+\.\d{2})\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s*$'
+    )
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if grand_total is None:
+                    m_tot = total_pat.match(line)
+                    if m_tot:
+                        grand_total = _recon_parse_amount(m_tot.group(1))
+                        continue
+                m = line_pat.match(line)
+                if not m:
+                    continue
+                date_str, inv_no, po_ref, amount_str = m.groups()
+                try:
+                    inv_date = datetime.strptime(date_str, "%b-%d-%y").date()
+                except ValueError:
+                    inv_date = None
+                records.append({
+                    "invoice_no": inv_no,
+                    "type":       None,
+                    "po_ref":     po_ref,
+                    "invoice_date": inv_date,
+                    "amount":     _recon_parse_amount(amount_str),
+                    "balance":    None,
+                    "day":        None,
+                })
+    return records, grand_total
+
+
+def parse_proden_statement(filename: str, file_bytes: bytes) -> tuple:
+    """Dispatch for Proden's statement. Only PDF has been seen from this
+    vendor so far."""
+    if filename.lower().endswith(".pdf"):
+        return parse_proden_statement_pdf(file_bytes)
+    raise ValueError("Only PDF statements are supported for Proden right now.")
+
+
 def parse_system_extract(file_bytes: bytes) -> dict:
     """
     Parse the accounting-system AP extract (any vendor — the export is the
@@ -1625,6 +1686,7 @@ def make_recon_report(buckets: dict, statement_total: float, grand_total: "float
 RECON_VENDORS = {
     "atlantic": {"label": "Atlantic Packaging",  "parse_statement": parse_atlantic_statement, "check_po": True},
     "bourret":  {"label": "Transport Bourret",   "parse_statement": parse_bourret_statement,  "check_po": False},
+    "proden":   {"label": "Les Entreprises Proden", "parse_statement": parse_proden_statement, "check_po": True},
 }
 
 
