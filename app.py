@@ -125,6 +125,7 @@ def init_state():
         "recon_upload_key":        0,
         "recon_statement_total":   None,
         "recon_grand_total":       None,
+        "recon_check_po":          True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1268,6 +1269,93 @@ def parse_atlantic_statement(filename: str, file_bytes: bytes) -> tuple:
     return parse_atlantic_statement_excel(file_bytes)
 
 
+def _recon_parse_amount_eu(raw) -> "float | None":
+    """Parse a European-style amount — space thousands separator, comma
+    decimal (Transport Bourret's statement format), e.g. '1 542,81' ->
+    1542.81."""
+    if raw is None:
+        return None
+    s = re.sub(r'\s+', '', str(raw)).replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_bourret_statement_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Parse a Transport Bourret 'État de compte / Statement' PDF.
+    Each line looks like:
+      07/21/2026 08/20/2026 14597313 2009575/MDBL236811 1 542,81$
+    (invoice date, due date, invoice #, customer reference — often blank,
+    sometimes a composite of several tokens — and amount). The reference is
+    captured for display only; Bourret's reference is a shipment/BOL number,
+    not a PO, so it isn't compared against anything (see check_po in
+    RECON_VENDORS).
+
+    Parsed by tokens rather than a single regex: the amount is always the
+    last token (ends in ',DD$'); a plain 1-3 digit token right before it is
+    a space-grouped thousands prefix ('1 542,81$' -> amount, not part of the
+    reference) — everything else between the invoice number and the amount
+    is the reference, however many tokens or separators (/, -) it contains.
+    A pure regex can't tell a 6-digit numeric reference like '360676' apart
+    from a thousands-prefix + amount ('360' + '676 946,01$' both look like
+    valid amount shapes) — the token approach resolves it by only ever
+    treating a *short* (<=3 digit) trailing token as a thousands group.
+    """
+    records = []
+    grand_total = None
+    date_pat        = re.compile(r'^\d{2}/\d{2}/\d{4}$')
+    invoice_no_pat  = re.compile(r'^\d{7,9}$')
+    amount_end_pat  = re.compile(r'^(\d+),(\d{2})\$$')
+    thousands_pat   = re.compile(r'^\d{1,3}$')
+    total_pat       = re.compile(r'Total\s+(\d{1,3}(?:\s\d{3})*,\d{2})\$')
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            if grand_total is None:
+                m = total_pat.search(text)
+                if m:
+                    grand_total = _recon_parse_amount_eu(m.group(1))
+            for line in text.splitlines():
+                tokens = line.strip().split()
+                if (len(tokens) < 4
+                        or not date_pat.match(tokens[0])
+                        or not date_pat.match(tokens[1])
+                        or not invoice_no_pat.match(tokens[2])):
+                    continue
+                date_str, inv_no, rest = tokens[0], tokens[2], tokens[3:]
+                if not rest or not amount_end_pat.match(rest[-1]):
+                    continue
+                amount_tokens = [rest[-1]]
+                ref_tokens = rest[:-1]
+                if ref_tokens and thousands_pat.match(ref_tokens[-1]):
+                    amount_tokens.insert(0, ref_tokens.pop())
+                try:
+                    inv_date = datetime.strptime(date_str, "%m/%d/%Y").date()
+                except ValueError:
+                    inv_date = None
+                records.append({
+                    "invoice_no": inv_no,
+                    "type":       None,
+                    "po_ref":     " ".join(ref_tokens) or None,
+                    "invoice_date": inv_date,
+                    "amount":     _recon_parse_amount_eu(" ".join(amount_tokens).rstrip("$")),
+                    "balance":    None,
+                    "day":        None,
+                })
+    return records, grand_total
+
+
+def parse_bourret_statement(filename: str, file_bytes: bytes) -> tuple:
+    """Dispatch for Transport Bourret's statement. Only PDF has been seen
+    from this vendor so far."""
+    if filename.lower().endswith(".pdf"):
+        return parse_bourret_statement_pdf(file_bytes)
+    raise ValueError("Only PDF statements are supported for Transport Bourret right now.")
+
+
 def parse_system_extract(file_bytes: bytes) -> dict:
     """
     Parse the accounting-system AP extract (any vendor — the export is the
@@ -1364,10 +1452,10 @@ def parse_extraction_excel(file_bytes: bytes) -> dict:
     return records
 
 
-def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict) -> dict:
+def reconcile_statement(statement: list, system: dict, extraction: dict, check_po: bool = True) -> dict:
     """
     Drive the reconciliation off the vendor statement (per the workflow: the
-    statement is what Atlantic sends us, so every line in it must be
+    statement is what the vendor sends us, so every line in it must be
     accounted for). For each statement line:
       1. Look it up in the copy-tracking extract by invoice number (this is
          independent of registration status — every entry gets a has_copy /
@@ -1379,9 +1467,12 @@ def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict
            entirely — no separate top-level bucket for that distinction).
          - Found + amount matches -> matched
          - Found + amount differs -> amount_mismatch
-      3. Whenever there's a copy on file, compare its PO (from the file name)
-         against the statement's PO/customer-reference -> po_mismatch (this
-         can happen on a matched invoice too, not just a pending one).
+      3. When check_po is True and there's a copy on file, compare its PO
+         (from the file name) against the statement's PO/customer-reference
+         -> po_mismatch (this can happen on a matched invoice too, not just
+         a pending one). Some vendors' "reference" isn't a PO at all (e.g.
+         Transport Bourret's is a shipment/BOL number) — check_po=False
+         skips this comparison entirely for those.
     """
     buckets = {
         "matched": [], "amount_mismatch": [],
@@ -1397,9 +1488,12 @@ def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict
         entry["location"]      = ext_rec["location"] if ext_rec else None
         entry["filename"]      = ext_rec["filename"] if ext_rec else None
 
-        po_a = str(line.get("po_ref") or "").strip().upper()
-        po_b = str((ext_rec or {}).get("po") or "").strip().upper()
-        entry["po_mismatch"] = bool(ext_rec is not None and po_a and po_b and po_a != po_b)
+        if check_po:
+            po_a = str(line.get("po_ref") or "").strip().upper()
+            po_b = str((ext_rec or {}).get("po") or "").strip().upper()
+            entry["po_mismatch"] = bool(ext_rec is not None and po_a and po_b and po_a != po_b)
+        else:
+            entry["po_mismatch"] = False
 
         sys_rec = system.get(inv_no)
         if sys_rec is not None:
@@ -1422,7 +1516,7 @@ def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict
     return buckets
 
 
-def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
+def build_recon_summary_rows(buckets: dict, statement_total: float, check_po: bool = True) -> list:
     """
     Build the reconciliation summary as a flat, hierarchical list of
     (label, count, amount) rows — mirroring the AP team's own manual
@@ -1430,7 +1524,8 @@ def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
     split with a balancing check, then a breakdown of Not Reconciled by
     whether we have a copy on file, then a 'To Review' section for the
     cross-cutting discrepancy flags. Blank label = section break; None in
-    count/amount = leave that cell empty.
+    count/amount = leave that cell empty. The PO Mismatch line is omitted
+    when check_po is False (vendors whose "reference" isn't a PO).
     """
     matched   = buckets["matched"]
     mismatch  = buckets["amount_mismatch"]
@@ -1455,7 +1550,7 @@ def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
     check = round(statement_total - reconciled_amt - not_reconciled_amt, 2)
     check = 0.0 if abs(check) < 0.005 else check
 
-    return [
+    rows = [
         ("Total Statement",                    len(matched) + len(pending) + len(mismatch), round(statement_total, 2)),
         ("Reconciled",                         len(matched), reconciled_amt),
         ("Not Reconciled",                     len(pending), not_reconciled_amt),
@@ -1467,20 +1562,24 @@ def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
         ("", None, None),
         ("To Review",                          None, None),
         ("  Amount Mismatch",                  len(mismatch), mismatch_amt),
-        ("  PO Mismatch",                      len(po_mism), amt(po_mism)),
     ]
+    if check_po:
+        rows.append(("  PO Mismatch", len(po_mism), amt(po_mism)))
+    return rows
 
 
-def make_recon_report(buckets: dict, statement_total: float, grand_total: "float | None") -> bytes:
+def make_recon_report(buckets: dict, statement_total: float, grand_total: "float | None",
+                       check_po: bool = True) -> bytes:
     """Build the downloadable Excel report: a Summary sheet (hierarchical
     counts/totals plus the statement-total sanity check) plus one sheet per
-    category."""
+    category. The PO Mismatch sheet is omitted when check_po is False."""
     sheet_specs = [
         ("Matched",              buckets["matched"]),
         ("Amount Mismatch",      buckets["amount_mismatch"]),
         ("Pending Registration", buckets["pending_registration"]),
-        ("PO Mismatch",          buckets["po_mismatch"]),
     ]
+    if check_po:
+        sheet_specs.append(("PO Mismatch", buckets["po_mismatch"]))
     cols = [
         "invoice_no", "type", "invoice_date", "po_ref", "amount", "day",
         "registered", "system_total", "costctr", "paid", "payment_date",
@@ -1490,7 +1589,7 @@ def make_recon_report(buckets: dict, statement_total: float, grand_total: "float
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary_rows = [
             {"Category": label, "Invoice Count": count, "Total Amount (CAD)": amount}
-            for label, count, amount in build_recon_summary_rows(buckets, statement_total)
+            for label, count, amount in build_recon_summary_rows(buckets, statement_total, check_po)
         ]
         summary_rows.append({"Category": "", "Invoice Count": None, "Total Amount (CAD)": None})
         summary_rows.append({
@@ -1520,8 +1619,12 @@ def make_recon_report(buckets: dict, statement_total: float, grand_total: "float
 # The system extract and the copy-tracking Excel are vendor-agnostic (the
 # user exports them already scoped to one vendor), only the statement needs
 # a vendor-specific parser — add new vendors here as their templates are built.
+# check_po: whether the statement's reference column is a PO worth comparing
+# against the copy-tracking file name (False for vendors like Transport
+# Bourret, whose reference is a shipment/BOL number, not a PO).
 RECON_VENDORS = {
-    "atlantic": {"label": "Atlantic Packaging", "parse_statement": parse_atlantic_statement},
+    "atlantic": {"label": "Atlantic Packaging",  "parse_statement": parse_atlantic_statement, "check_po": True},
+    "bourret":  {"label": "Transport Bourret",   "parse_statement": parse_bourret_statement,  "check_po": False},
 }
 
 
@@ -2742,8 +2845,9 @@ if active_module == "recon":
 
     if do_recon:
         try:
-            parse_statement = RECON_VENDORS[recon_vendor]["parse_statement"]
-            statement, grand_total = parse_statement(
+            vendor_cfg = RECON_VENDORS[recon_vendor]
+            check_po = vendor_cfg.get("check_po", True)
+            statement, grand_total = vendor_cfg["parse_statement"](
                 recon_statement_file.name, recon_statement_file.read()
             )
             system = parse_system_extract(recon_system_file.read())
@@ -2754,12 +2858,13 @@ if active_module == "recon":
             if not statement:
                 st.error("Could not find any invoice lines in the statement. Check the file format.")
             else:
-                buckets = reconcile_atlantic_statement(statement, system, extraction)
+                buckets = reconcile_statement(statement, system, extraction, check_po)
                 statement_total = sum((r.get("amount") or 0) for r in statement)
                 st.session_state.recon_results = buckets
                 st.session_state.recon_statement_total = statement_total
                 st.session_state.recon_grand_total = grand_total
-                st.session_state.recon_zip = make_recon_report(buckets, statement_total, grand_total)
+                st.session_state.recon_check_po = check_po
+                st.session_state.recon_zip = make_recon_report(buckets, statement_total, grand_total, check_po)
         except Exception as e:
             st.error(f"Error during reconciliation: {e}")
 
@@ -2767,6 +2872,7 @@ if active_module == "recon":
     if buckets:
         statement_total = st.session_state.recon_statement_total
         grand_total = st.session_state.recon_grand_total
+        check_po = st.session_state.recon_check_po
         if grand_total is not None:
             diff = round(statement_total - grand_total, 2)
             if abs(diff) <= 0.02:
@@ -2782,7 +2888,7 @@ if active_module == "recon":
                 )
         else:
             st.warning(
-                f"Could not find a 'Total Owing' figure in the file to check against — "
+                f"Could not find a total figure on the statement to check against — "
                 f"parsed lines add up to **CAD {statement_total:,.2f}**."
             )
 
@@ -2792,7 +2898,7 @@ if active_module == "recon":
                 (label,
                  "" if count is None else f"{count:,}",
                  "" if amount is None else f"{amount:,.2f}")
-                for label, count, amount in build_recon_summary_rows(buckets, statement_total)
+                for label, count, amount in build_recon_summary_rows(buckets, statement_total, check_po)
             ],
             columns=["Category", "Invoice Count", "Amount (CAD)"],
         )
