@@ -1442,17 +1442,23 @@ def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
     def amt(rows):
         return round(sum((r.get("amount") or 0) for r in rows), 2)
 
-    reconciled_amt     = amt(matched)
-    not_reconciled_amt = amt(pending)
-    mismatch_amt       = amt(mismatch)
-    check = round(statement_total - reconciled_amt - not_reconciled_amt - mismatch_amt, 2)
+    mismatch_amt = amt(mismatch)
+    # "Reconciled" money-wise means "accounted for in the system" — so its
+    # amount includes invoices registered with a discrepancy too (those are
+    # still in the system, just flagged in "To Review" for the exact figure).
+    # Its count, however, is the clean-match count only, so the discrepancy
+    # count is visible on its own line in "To Review" instead of hiding
+    # inside "Reconciled". Not Reconciled is simpler: not in the system at
+    # all, so count and amount both mean the same population there.
+    reconciled_amt      = round(amt(matched) + mismatch_amt, 2)
+    not_reconciled_amt  = amt(pending)
+    check = round(statement_total - reconciled_amt - not_reconciled_amt, 2)
     check = 0.0 if abs(check) < 0.005 else check
 
     return [
         ("Total Statement",                    len(matched) + len(pending) + len(mismatch), round(statement_total, 2)),
         ("Reconciled",                         len(matched), reconciled_amt),
         ("Not Reconciled",                     len(pending), not_reconciled_amt),
-        ("Amount Mismatch (to review)",        len(mismatch), mismatch_amt),
         ("Reconciliation Check",               None, check),
         ("", None, None),
         ("Not Reconciled — breakdown",         None, None),
