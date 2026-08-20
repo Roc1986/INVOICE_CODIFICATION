@@ -95,6 +95,7 @@ VENDOR_EXCEPCION = "0101000390"
 # ─────────────────────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
+        "active_module":       None,
         "proveedores":         copy.deepcopy(DEFAULT_PROVEEDORES),
         "gl_codes":            copy.deepcopy(DEFAULT_GL_CODES),
         "usuarios":            DEFAULT_USERS.copy(),
@@ -118,6 +119,10 @@ def init_state():
         "payment_result":          None,
         "payment_batches":         [],   # [{"label", "files": [{"name", "bytes"}]}]
         "payment_batch_form_key":  0,
+        # Reconciliation state
+        "recon_results":           None,
+        "recon_zip":               None,
+        "recon_upload_key":        0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1129,6 +1134,305 @@ def extract_invoice_amounts(pdf_bytes: bytes) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── STATEMENT RECONCILIATION FUNCTIONS ────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _recon_parse_amount(raw) -> "float | None":
+    """Parse an amount that may be a number already, or text like '1,234.56' /
+    '1,234.56-' (Crystal Reports puts the minus sign for credits at the end)."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip().replace(",", "")
+    if not s:
+        return None
+    neg = s.endswith("-")
+    if neg:
+        s = s[:-1]
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    return -val if neg else val
+
+
+def parse_atlantic_statement_pdf(pdf_bytes: bytes) -> list:
+    """
+    Parse an Atlantic 'Statement of Account' PDF.
+    Each line looks like:
+      24-03-26 WPD 87059502 R0015751 37,303.43 37,303.43 143
+    (date, type code, invoice #, customer reference / PO, invoice amount,
+    balance owing, days). Credit-memo lines carry a trailing '-' on the amount.
+    """
+    records = []
+    line_pat = re.compile(
+        r'^(\d{2}-\d{2}-\d{2})\s+([A-Z]{3})\s+(\d{6,9})\s+(\S+)\s+'
+        r'([\d,]+\.\d{2}-?)\s+([\d,]+\.\d{2}-?)\s+(\d+)\s*$'
+    )
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                m = line_pat.match(line.strip())
+                if not m:
+                    continue
+                date_str, typ, inv_no, ref, amount_str, balance_str, day = m.groups()
+                try:
+                    inv_date = datetime.strptime(date_str, "%d-%m-%y").date()
+                except ValueError:
+                    inv_date = None
+                records.append({
+                    "invoice_no": inv_no,
+                    "type":       typ,
+                    "po_ref":     ref,
+                    "invoice_date": inv_date,
+                    "amount":     _recon_parse_amount(amount_str),
+                    "balance":    _recon_parse_amount(balance_str),
+                    "day":        int(day),
+                })
+    return records
+
+
+def parse_atlantic_statement_excel(file_bytes: bytes) -> list:
+    """
+    Parse the Excel export of the same Atlantic statement (B2Win 'b2win'
+    sheet). Columns: CAD marker | date | type | invoice # | cust reference |
+    invoice amount | balance owing | day.
+    """
+    records = []
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+    for sheet in wb.worksheets:
+        if "b2win" in sheet.title.lower():
+            ws = sheet
+            break
+
+    inv_pat = re.compile(r'^\d{6,9}$')
+    for row in ws.iter_rows(values_only=True):
+        if not row or len(row) < 8:
+            continue
+        marker, inv_date, typ, inv_no, ref, amount, balance, day = row[:8]
+        if str(marker).strip().upper() != "CAD":
+            continue
+        if not inv_no or not inv_pat.match(str(inv_no).strip()):
+            continue
+        if hasattr(inv_date, "date"):
+            inv_date = inv_date.date()
+        records.append({
+            "invoice_no": str(inv_no).strip(),
+            "type":       str(typ).strip() if typ else None,
+            "po_ref":     str(ref).strip() if ref else None,
+            "invoice_date": inv_date if isinstance(inv_date, date) else None,
+            "amount":     _recon_parse_amount(amount),
+            "balance":    _recon_parse_amount(balance),
+            "day":        int(day) if day is not None else None,
+        })
+    return records
+
+
+def parse_atlantic_statement(filename: str, file_bytes: bytes) -> list:
+    """Dispatch to the PDF or Excel parser based on the file extension."""
+    if filename.lower().endswith(".pdf"):
+        return parse_atlantic_statement_pdf(file_bytes)
+    return parse_atlantic_statement_excel(file_bytes)
+
+
+def parse_system_extract(file_bytes: bytes) -> dict:
+    """
+    Parse the accounting-system AP extract (any vendor — the export is the
+    same GL/voucher layout regardless of who the invoices belong to).
+    Returns { invoice_no: {"total", "costctr", "paid", "payment_date"} }.
+    An invoice can span several GL allocation lines (same invoice #, same
+    total, different account/cost-centre) — those are collapsed into one
+    record; a payment on ANY of its lines marks the invoice as paid.
+    """
+    df = pd.read_excel(BytesIO(file_bytes))
+    cols = {c.strip().lower(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
+
+    c_inv   = col("invoice")
+    c_total = col("invoicetotal")
+    c_cc    = col("costctr")
+    c_pay   = col("paymentno")
+    c_paydt = col("paymentdate")
+    if c_inv is None or c_total is None:
+        return {}
+
+    records = {}
+    for _, row in df.iterrows():
+        inv_no = str(row[c_inv]).strip() if pd.notna(row[c_inv]) else ""
+        if not inv_no:
+            continue
+        total = float(row[c_total]) if pd.notna(row[c_total]) else 0.0
+        paid  = c_pay is not None and pd.notna(row[c_pay])
+        rec = records.get(inv_no)
+        if rec is None:
+            rec = {
+                "invoice_no":   inv_no,
+                "total":        total,
+                "costctr":      row[c_cc] if c_cc is not None and pd.notna(row[c_cc]) else None,
+                "paid":         False,
+                "payment_date": None,
+            }
+            records[inv_no] = rec
+        if paid:
+            rec["paid"] = True
+            if c_paydt is not None and pd.notna(row[c_paydt]):
+                rec["payment_date"] = row[c_paydt]
+    return records
+
+
+def parse_extraction_excel(file_bytes: bytes) -> dict:
+    """
+    Parse the invoice-copy tracking Excel (folder listing exported from the
+    Atlantic invoices share). Returns { invoice_no: {"po", "location", "filename"} }.
+    Expects columns named 'Name' (file name), 'Colonne2' (PO extracted from
+    the file name) and 'Colonne4' (folder location relative to the share root).
+    """
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}
+    header = [str(h).strip() if h else "" for h in rows[0]]
+
+    def idx(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+
+    idx_name = idx("Name")
+    idx_po   = idx("Colonne2")
+    idx_loc  = idx("Colonne4")
+    if idx_name is None:
+        return {}
+
+    inv_pat = re.compile(r'^(\d{6,9})\b')
+    records = {}
+    for row in rows[1:]:
+        name = row[idx_name] if idx_name < len(row) else None
+        if not name:
+            continue
+        m = inv_pat.match(str(name).strip())
+        if not m:
+            continue
+        inv_no = m.group(1)
+        po  = row[idx_po]  if idx_po  is not None and idx_po  < len(row) else None
+        loc = row[idx_loc] if idx_loc is not None and idx_loc < len(row) else None
+        records[inv_no] = {
+            "po":       str(po).strip() if po else None,
+            "location": str(loc).strip() if loc else None,
+            "filename": str(name).strip(),
+        }
+    return records
+
+
+def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict) -> dict:
+    """
+    Drive the reconciliation off the vendor statement (per the workflow: the
+    statement is what Atlantic sends us, so every line in it must be
+    accounted for). For each statement line:
+      1. Look it up in the system extract by invoice number.
+         - Found + amount matches  -> matched
+         - Found + amount differs  -> amount_mismatch
+      2. Not found in the system -> look it up in the copy-tracking extract.
+         - Found there  -> pending_register (we have the file, not entered yet)
+         - Not found     -> no_copy (nothing on file, most urgent)
+      3. Whenever we have a copy, compare its PO (from the file name) against
+         the statement's PO/customer-reference -> po_mismatch.
+    """
+    buckets = {
+        "matched": [], "amount_mismatch": [],
+        "pending_register": [], "no_copy": [], "po_mismatch": [],
+    }
+    for line in statement:
+        inv_no = line["invoice_no"]
+        entry = dict(line)
+        sys_rec = system.get(inv_no)
+
+        if sys_rec is not None:
+            entry["registered"]   = True
+            entry["system_total"] = sys_rec["total"]
+            entry["costctr"]      = sys_rec["costctr"]
+            entry["paid"]         = sys_rec["paid"]
+            entry["payment_date"] = sys_rec["payment_date"]
+            if abs(abs(line["amount"] or 0) - abs(sys_rec["total"] or 0)) > 0.02:
+                buckets["amount_mismatch"].append(entry)
+            else:
+                buckets["matched"].append(entry)
+            continue
+
+        entry["registered"] = False
+        ext_rec = extraction.get(inv_no)
+        if ext_rec is not None:
+            entry["has_copy"]       = True
+            entry["extraction_po"]  = ext_rec["po"]
+            entry["location"]       = ext_rec["location"]
+            entry["filename"]       = ext_rec["filename"]
+            buckets["pending_register"].append(entry)
+        else:
+            entry["has_copy"] = False
+            buckets["no_copy"].append(entry)
+
+        po_a = str(line.get("po_ref") or "").strip().upper()
+        po_b = str((ext_rec or {}).get("po") or "").strip().upper()
+        if ext_rec is not None and po_a and po_b and po_a != po_b:
+            buckets["po_mismatch"].append(entry)
+
+    return buckets
+
+
+def make_recon_report(buckets: dict) -> bytes:
+    """Build the downloadable Excel report: a Resumen sheet plus one sheet
+    per category."""
+    sheet_specs = [
+        ("Conciliado",              buckets["matched"]),
+        ("Discrepancia Monto",      buckets["amount_mismatch"]),
+        ("Pendiente de Registrar",  buckets["pending_register"]),
+        ("Sin Copia",               buckets["no_copy"]),
+        ("Discrepancia PO",         buckets["po_mismatch"]),
+    ]
+    cols = [
+        "invoice_no", "type", "invoice_date", "po_ref", "amount", "day",
+        "registered", "system_total", "costctr", "paid", "payment_date",
+        "has_copy", "extraction_po", "location", "filename",
+    ]
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary_rows = [
+            {"Categoría": label, "Cantidad de facturas": len(rows),
+             "Monto total (CAD)": round(sum((r.get("amount") or 0) for r in rows), 2)}
+            for label, rows in sheet_specs
+        ]
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen", index=False)
+        for label, rows in sheet_specs:
+            if rows:
+                df = pd.DataFrame(rows)
+                df = df[[c for c in cols if c in df.columns]]
+            else:
+                df = pd.DataFrame(columns=cols)
+            df.to_excel(writer, sheet_name=label[:31], index=False)
+    buf.seek(0)
+    return buf.read()
+
+
+# Registry of vendors the Reconciliation module can parse a statement for.
+# The system extract and the copy-tracking Excel are vendor-agnostic (the
+# user exports them already scoped to one vendor), only the statement needs
+# a vendor-specific parser — add new vendors here as their templates are built.
+RECON_VENDORS = {
+    "atlantic": {"label": "Atlantic Packaging", "parse_statement": parse_atlantic_statement},
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSS STYLES
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -1177,13 +1481,50 @@ st.markdown("""
     border-left-color: #ffc107 !important;
     background: #fffdf0 !important;
 }
+.module-card [data-testid="stVerticalBlockBorderWrapper"] {
+    transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.module-card:hover [data-testid="stVerticalBlockBorderWrapper"] {
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+    transform: translateY(-2px);
+}
+.module-icon { font-size: 34px; line-height: 1; }
+.module-label { font-size: 17px; font-weight: 700; margin-top: 6px; }
+.module-desc  { font-size: 13px; color: #6c757d; margin-top: 2px; min-height: 34px; }
 </style>
 """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE REGISTRY
+# ─────────────────────────────────────────────────────────────────────────────
+MODULES = [
+    {"key": "splitter", "icon": "✂️",  "label": "Invoice Splitter",  "desc": "Split batch PDFs into individual invoice files."},
+    {"key": "matcher",  "icon": "🔗", "label": "Invoice Matcher",   "desc": "Match invoices with POs and merge into one PDF."},
+    {"key": "coding",   "icon": "🏷️",  "label": "Invoice Coding",    "desc": "Stamp GL / Cost Centre codes on invoices."},
+    {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
+    {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
+    {"key": "recon",    "icon": "🧮", "label": "Statement Reconciliation", "desc": "Reconcile Atlantic's statement against the system and invoice copies."},
+    {"key": "payment",  "icon": "💳", "label": "Payment Packager",  "desc": "Bundle invoices into payment batches."},
+    {"key": "database", "icon": "🗄️",  "label": "Database",          "desc": "Manage vendors, GL codes & users."},
+    {"key": "settings", "icon": "⚙️",  "label": "Settings",          "desc": "Configure the coding stamp position."},
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("## 📂 Modules")
+    nav_labels = ["🏠 Home"] + [f"{m['icon']} {m['label']}" for m in MODULES]
+    nav_keys   = [None] + [m["key"] for m in MODULES]
+    nav_idx    = nav_keys.index(st.session_state.active_module) \
+        if st.session_state.active_module in nav_keys else 0
+    picked = st.selectbox("Go to", nav_labels, index=nav_idx, label_visibility="collapsed")
+    picked_key = nav_keys[nav_labels.index(picked)]
+    if picked_key != st.session_state.active_module:
+        st.session_state.active_module = picked_key
+        st.rerun()
+
+    st.divider()
     st.markdown("## ⚙️ Work Session")
 
     user_list = st.session_state.usuarios + ["✏️ Other..."]
@@ -1246,26 +1587,50 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN HEADER
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<h1 style='margin-bottom:0'>📄 Atlantic — Invoice Tools</h1>
-<p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
-""", unsafe_allow_html=True)
+active_module = st.session_state.active_module
 
-tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_pay, tab_db, tab_cfg = st.tabs([
-    "✂️  Invoice Splitter",
-    "🔗  Invoice Matcher",
-    "🏷️  Invoice Coding",
-    "📊  Couru Code",
-    "🔍  AP Audit",
-    "💳  Payment Packager",
-    "🗄️  Database",
-    "⚙️  Settings",
-])
+if active_module is None:
+    st.markdown("""
+    <h1 style='margin-bottom:0'>📄 Atlantic — Invoice Tools</h1>
+    <p style='color:gray;margin-top:4px'>Pick a module to get started</p>
+    """, unsafe_allow_html=True)
+
+    n_cols = 4
+    rows = [MODULES[i:i + n_cols] for i in range(0, len(MODULES), n_cols)]
+    for row in rows:
+        cols = st.columns(n_cols)
+        for col, mod in zip(cols, row):
+            with col:
+                st.markdown('<div class="module-card">', unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div class='module-icon'>{mod['icon']}</div>"
+                        f"<div class='module-label'>{mod['label']}</div>"
+                        f"<div class='module-desc'>{mod['desc']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open →", key=f"open_{mod['key']}", use_container_width=True):
+                        st.session_state.active_module = mod["key"]
+                        st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+else:
+    active_mod = next(m for m in MODULES if m["key"] == active_module)
+    col_home, col_title = st.columns([1, 6])
+    with col_home:
+        if st.button("🏠 Home", use_container_width=True):
+            st.session_state.active_module = None
+            st.rerun()
+    with col_title:
+        st.markdown(
+            f"<h2 style='margin:2px 0 0 0'>{active_mod['icon']} {active_mod['label']}</h2>",
+            unsafe_allow_html=True,
+        )
+    st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — INVOICE SPLITTER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_split:
+if active_module == "splitter":
     st.subheader("✂️ Split Batch Invoice PDFs")
     st.markdown(
         "Upload one or more **batch PDFs** from Atlantic (each may contain multiple invoices). "
@@ -1404,7 +1769,7 @@ with tab_split:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — INVOICE MATCHER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_match:
+if active_module == "matcher":
     st.subheader("🔗 Invoice & PO Matcher")
     st.markdown(
         "Upload your invoice PDFs and your PO (Purchase Order) PDFs. "
@@ -1571,7 +1936,7 @@ with tab_match:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — INVOICE CODING (upload + review + results unified)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_cod:
+if active_module == "coding":
     if "upload_key" not in st.session_state:
         st.session_state.upload_key = 0
 
@@ -1877,7 +2242,7 @@ with tab_cod:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — COURU CODE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_couru:
+if active_module == "couru":
     st.subheader("📊 Couru Code — Invoice Report")
     st.markdown(
         "Upload invoice PDFs to extract key data and download an Excel report "
@@ -1972,7 +2337,7 @@ with tab_couru:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — AP AUDIT VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_audit:
+if active_module == "audit":
     st.subheader("🔍 AP Audit Validation")
     st.markdown(
         "Cross-reference invoice PDFs against the **A/P Voucher Audit Listing** "
@@ -2224,9 +2589,152 @@ with tab_audit:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TAB — STATEMENT RECONCILIATION
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "recon":
+    st.subheader("🧮 Statement Reconciliation")
+    st.markdown(
+        "Reconcile a vendor's **statement of account** against the accounting system "
+        "and the invoice-copy tracking Excel. The tool walks every invoice on the "
+        "statement and checks: is it registered in the system, does the amount match, "
+        "do we have a copy on file, and does the PO on the statement match the PO on "
+        "the file name."
+    )
+
+    vendor_keys = list(RECON_VENDORS.keys())
+    recon_vendor = st.selectbox(
+        "1️⃣ Proveedor a conciliar",
+        vendor_keys,
+        format_func=lambda k: RECON_VENDORS[k]["label"],
+    )
+    st.caption(
+        "El extracto del sistema y el excel de extracción de copias ya vienen "
+        "filtrados a este proveedor cuando los exportás — no se aplica ningún "
+        "filtro adicional por nombre; el proveedor solo determina qué plantilla "
+        "se usa para leer el **statement**."
+    )
+
+    st.markdown("**2️⃣ Adjuntar soportes**")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        recon_statement_file = st.file_uploader(
+            "📄 Statement of Account (PDF or Excel)",
+            type=["pdf", "xlsx"],
+            key=f"recon_statement_{st.session_state.recon_upload_key}",
+        )
+    with col_b:
+        recon_system_file = st.file_uploader(
+            "🗄️ System extract (Excel)",
+            type=["xlsx"],
+            key=f"recon_system_{st.session_state.recon_upload_key}",
+        )
+    with col_c:
+        recon_extraction_file = st.file_uploader(
+            "📁 Invoice-copy tracking Excel (optional)",
+            type=["xlsx"],
+            key=f"recon_extraction_{st.session_state.recon_upload_key}",
+        )
+
+    col_run, col_clear = st.columns([1, 5])
+    with col_run:
+        do_recon = st.button(
+            "🧮 Reconcile", type="primary",
+            disabled=not (recon_statement_file and recon_system_file),
+        )
+    with col_clear:
+        if st.button("🗑️ Clear", key="recon_clear"):
+            st.session_state.recon_results = None
+            st.session_state.recon_zip = None
+            st.session_state.recon_upload_key += 1
+            st.rerun()
+
+    if do_recon:
+        try:
+            parse_statement = RECON_VENDORS[recon_vendor]["parse_statement"]
+            statement = parse_statement(
+                recon_statement_file.name, recon_statement_file.read()
+            )
+            system = parse_system_extract(recon_system_file.read())
+            extraction = (
+                parse_extraction_excel(recon_extraction_file.read())
+                if recon_extraction_file else {}
+            )
+            if not statement:
+                st.error("Could not find any invoice lines in the statement. Check the file format.")
+            else:
+                buckets = reconcile_atlantic_statement(statement, system, extraction)
+                st.session_state.recon_results = buckets
+                st.session_state.recon_zip = make_recon_report(buckets)
+        except Exception as e:
+            st.error(f"Error during reconciliation: {e}")
+
+    buckets = st.session_state.recon_results
+    if buckets:
+        n_matched   = len(buckets["matched"])
+        n_amount    = len(buckets["amount_mismatch"])
+        n_pending   = len(buckets["pending_register"])
+        n_no_copy   = len(buckets["no_copy"])
+        n_po        = len(buckets["po_mismatch"])
+        n_total     = n_matched + n_amount + n_pending + n_no_copy
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        stat_cols = st.columns(5)
+        stats = [
+            ("Total facturas", n_total, "blue"),
+            ("Conciliadas", n_matched, "green"),
+            ("Monto no coincide", n_amount, "red"),
+            ("Pendiente de registrar", n_pending, "amber"),
+            ("Sin copia", n_no_copy, "red"),
+        ]
+        for col, (label, num, color) in zip(stat_cols, stats):
+            with col:
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num {color}'>{num}</div>"
+                    f"<div class='stat-lbl'>{label}</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+        if n_po:
+            st.warning(f"⚠️ {n_po} factura(s) con PO distinto entre el statement y el nombre del archivo.")
+
+        st.download_button(
+            "⬇️ Download Reconciliation Report (Excel)",
+            data=st.session_state.recon_zip,
+            file_name=f"atlantic_reconciliation_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=False,
+        )
+
+        tab_labels = [
+            f"✅ Conciliadas ({n_matched})",
+            f"❌ Monto no coincide ({n_amount})",
+            f"🕓 Pendiente de registrar ({n_pending})",
+            f"🚨 Sin copia ({n_no_copy})",
+            f"🔀 PO no coincide ({n_po})",
+        ]
+        tabs = st.tabs(tab_labels)
+        bucket_keys = ["matched", "amount_mismatch", "pending_register", "no_copy", "po_mismatch"]
+        display_cols = [
+            "invoice_no", "invoice_date", "po_ref", "amount", "system_total",
+            "registered", "paid", "has_copy", "extraction_po", "location",
+        ]
+        for tab, key in zip(tabs, bucket_keys):
+            with tab:
+                rows = buckets[key]
+                if not rows:
+                    st.info("Nothing here.")
+                else:
+                    df = pd.DataFrame(rows)
+                    df = df[[c for c in display_cols if c in df.columns]]
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+    elif not (recon_statement_file or recon_system_file):
+        st.info("📂 Upload the statement and the system extract to run the reconciliation.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — PAYMENT PACKAGER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_pay:
+if active_module == "payment":
     st.subheader("💳 Payment Packager — Build the invoice packages for a payment run")
     st.markdown(
         "This tool works entirely through **upload / download** — it does **not** need access "
@@ -2580,7 +3088,7 @@ with tab_pay:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 7 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_db:
+if active_module == "database":
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
 
     with db_t1:
@@ -2694,7 +3202,7 @@ with tab_db:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 8 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_cfg:
+if active_module == "settings":
     st.subheader("General Settings")
     col1, col2 = st.columns(2)
 
