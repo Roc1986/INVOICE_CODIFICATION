@@ -123,6 +123,8 @@ def init_state():
         "recon_results":           None,
         "recon_zip":               None,
         "recon_upload_key":        0,
+        "recon_statement_total":   None,
+        "recon_grand_total":       None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1157,15 +1159,33 @@ def _recon_parse_amount(raw) -> "float | None":
     return -val if neg else val
 
 
-def parse_atlantic_statement_pdf(pdf_bytes: bytes) -> list:
+_RECON_GRAND_TOTAL_PAT = re.compile(
+    r'Total\s+Ow[a-z]*\s*:?\s*(?:CAD)?\s*([\d,]+\.\d{2})', re.IGNORECASE
+)
+
+
+def _recon_find_grand_total(text: str) -> "float | None":
+    """Find the statement's own 'Total Owing' figure in free text, so the UI
+    can show it next to the sum of the parsed lines as a sanity check that
+    the file was read correctly."""
+    m = _RECON_GRAND_TOTAL_PAT.search(text)
+    if not m:
+        return None
+    return _recon_parse_amount(m.group(1))
+
+
+def parse_atlantic_statement_pdf(pdf_bytes: bytes) -> tuple:
     """
     Parse an Atlantic 'Statement of Account' PDF.
     Each line looks like:
       24-03-26 WPD 87059502 R0015751 37,303.43 37,303.43 143
     (date, type code, invoice #, customer reference / PO, invoice amount,
     balance owing, days). Credit-memo lines carry a trailing '-' on the amount.
+    Returns (records, grand_total) — grand_total is the 'Total Owing' figure
+    printed on the statement itself, or None if it couldn't be found.
     """
     records = []
+    grand_total = None
     line_pat = re.compile(
         r'^(\d{2}-\d{2}-\d{2})\s+([A-Z]{3})\s+(\d{6,9})\s+(\S+)\s+'
         r'([\d,]+\.\d{2}-?)\s+([\d,]+\.\d{2}-?)\s+(\d+)\s*$'
@@ -1173,6 +1193,8 @@ def parse_atlantic_statement_pdf(pdf_bytes: bytes) -> list:
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
+            if grand_total is None:
+                grand_total = _recon_find_grand_total(text)
             for line in text.splitlines():
                 m = line_pat.match(line.strip())
                 if not m:
@@ -1191,16 +1213,18 @@ def parse_atlantic_statement_pdf(pdf_bytes: bytes) -> list:
                     "balance":    _recon_parse_amount(balance_str),
                     "day":        int(day),
                 })
-    return records
+    return records, grand_total
 
 
-def parse_atlantic_statement_excel(file_bytes: bytes) -> list:
+def parse_atlantic_statement_excel(file_bytes: bytes) -> tuple:
     """
     Parse the Excel export of the same Atlantic statement (B2Win 'b2win'
     sheet). Columns: CAD marker | date | type | invoice # | cust reference |
     invoice amount | balance owing | day.
+    Returns (records, grand_total) — see parse_atlantic_statement_pdf.
     """
     records = []
+    grand_total = None
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb.active
     for sheet in wb.worksheets:
@@ -1215,6 +1239,11 @@ def parse_atlantic_statement_excel(file_bytes: bytes) -> list:
         marker, inv_date, typ, inv_no, ref, amount, balance, day = row[:8]
         if str(marker).strip().upper() != "CAD":
             continue
+        if grand_total is None and any("Total" in str(c) for c in row if c):
+            # Cells split words arbitrarily (e.g. 'Total Ow' | 'ing ') — join
+            # with no separator so the word and the trailing amount line up.
+            row_text = "".join(str(c) for c in row if c)
+            grand_total = _recon_find_grand_total(row_text)
         if not inv_no or not inv_pat.match(str(inv_no).strip()):
             continue
         if hasattr(inv_date, "date"):
@@ -1228,11 +1257,12 @@ def parse_atlantic_statement_excel(file_bytes: bytes) -> list:
             "balance":    _recon_parse_amount(balance),
             "day":        int(day) if day is not None else None,
         })
-    return records
+    return records, grand_total
 
 
-def parse_atlantic_statement(filename: str, file_bytes: bytes) -> list:
-    """Dispatch to the PDF or Excel parser based on the file extension."""
+def parse_atlantic_statement(filename: str, file_bytes: bytes) -> tuple:
+    """Dispatch to the PDF or Excel parser based on the file extension.
+    Returns (records, grand_total)."""
     if filename.lower().endswith(".pdf"):
         return parse_atlantic_statement_pdf(file_bytes)
     return parse_atlantic_statement_excel(file_bytes)
@@ -1339,24 +1369,39 @@ def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict
     Drive the reconciliation off the vendor statement (per the workflow: the
     statement is what Atlantic sends us, so every line in it must be
     accounted for). For each statement line:
-      1. Look it up in the system extract by invoice number.
-         - Found + amount matches  -> matched
-         - Found + amount differs  -> amount_mismatch
-      2. Not found in the system -> look it up in the copy-tracking extract.
-         - Found there  -> pending_register (we have the file, not entered yet)
-         - Not found     -> no_copy (nothing on file, most urgent)
-      3. Whenever we have a copy, compare its PO (from the file name) against
-         the statement's PO/customer-reference -> po_mismatch.
+      1. Look it up in the copy-tracking extract by invoice number (this is
+         independent of registration status — every entry gets a has_copy /
+         extraction_po / location, even when the copy-tracking file wasn't
+         supplied at all, in which case has_copy is simply False for all).
+      2. Look it up in the system extract by invoice number.
+         - Not found            -> pending_registration (has_copy tells you
+           whether the file is on hand and just needs entering, or missing
+           entirely — no separate top-level bucket for that distinction).
+         - Found + amount matches -> matched
+         - Found + amount differs -> amount_mismatch
+      3. Whenever there's a copy on file, compare its PO (from the file name)
+         against the statement's PO/customer-reference -> po_mismatch (this
+         can happen on a matched invoice too, not just a pending one).
     """
     buckets = {
         "matched": [], "amount_mismatch": [],
-        "pending_register": [], "no_copy": [], "po_mismatch": [],
+        "pending_registration": [], "po_mismatch": [],
     }
     for line in statement:
         inv_no = line["invoice_no"]
         entry = dict(line)
-        sys_rec = system.get(inv_no)
 
+        ext_rec = extraction.get(inv_no)
+        entry["has_copy"]      = ext_rec is not None
+        entry["extraction_po"] = ext_rec["po"] if ext_rec else None
+        entry["location"]      = ext_rec["location"] if ext_rec else None
+        entry["filename"]      = ext_rec["filename"] if ext_rec else None
+
+        po_a = str(line.get("po_ref") or "").strip().upper()
+        po_b = str((ext_rec or {}).get("po") or "").strip().upper()
+        entry["po_mismatch"] = bool(ext_rec is not None and po_a and po_b and po_a != po_b)
+
+        sys_rec = system.get(inv_no)
         if sys_rec is not None:
             entry["registered"]   = True
             entry["system_total"] = sys_rec["total"]
@@ -1367,51 +1412,93 @@ def reconcile_atlantic_statement(statement: list, system: dict, extraction: dict
                 buckets["amount_mismatch"].append(entry)
             else:
                 buckets["matched"].append(entry)
-            continue
-
-        entry["registered"] = False
-        ext_rec = extraction.get(inv_no)
-        if ext_rec is not None:
-            entry["has_copy"]       = True
-            entry["extraction_po"]  = ext_rec["po"]
-            entry["location"]       = ext_rec["location"]
-            entry["filename"]       = ext_rec["filename"]
-            buckets["pending_register"].append(entry)
         else:
-            entry["has_copy"] = False
-            buckets["no_copy"].append(entry)
+            entry["registered"] = False
+            buckets["pending_registration"].append(entry)
 
-        po_a = str(line.get("po_ref") or "").strip().upper()
-        po_b = str((ext_rec or {}).get("po") or "").strip().upper()
-        if ext_rec is not None and po_a and po_b and po_a != po_b:
+        if entry["po_mismatch"]:
             buckets["po_mismatch"].append(entry)
 
     return buckets
 
 
-def make_recon_report(buckets: dict) -> bytes:
-    """Build the downloadable Excel report: a Resumen sheet plus one sheet
-    per category."""
+def build_recon_summary_rows(buckets: dict, statement_total: float) -> list:
+    """
+    Build the reconciliation summary as a flat, hierarchical list of
+    (label, count, amount) rows — mirroring the AP team's own manual
+    reconciliation layout: a top-level Total / Reconciled / Not Reconciled
+    split with a balancing check, then a breakdown of Not Reconciled by
+    whether we have a copy on file, then a 'To Review' section for the
+    cross-cutting discrepancy flags. Blank label = section break; None in
+    count/amount = leave that cell empty.
+    """
+    matched   = buckets["matched"]
+    mismatch  = buckets["amount_mismatch"]
+    pending   = buckets["pending_registration"]
+    po_mism   = buckets["po_mismatch"]
+    pending_with_copy = [r for r in pending if r["has_copy"]]
+    pending_no_copy   = [r for r in pending if not r["has_copy"]]
+
+    def amt(rows):
+        return round(sum((r.get("amount") or 0) for r in rows), 2)
+
+    reconciled_amt     = amt(matched)
+    not_reconciled_amt = amt(pending)
+    mismatch_amt       = amt(mismatch)
+    check = round(statement_total - reconciled_amt - not_reconciled_amt - mismatch_amt, 2)
+    check = 0.0 if abs(check) < 0.005 else check
+
+    return [
+        ("Total Statement",                    len(matched) + len(pending) + len(mismatch), round(statement_total, 2)),
+        ("Reconciled",                         len(matched), reconciled_amt),
+        ("Not Reconciled",                     len(pending), not_reconciled_amt),
+        ("Amount Mismatch (to review)",        len(mismatch), mismatch_amt),
+        ("Reconciliation Check",               None, check),
+        ("", None, None),
+        ("Not Reconciled — breakdown",         None, None),
+        ("  Pending Registration (has copy)",  len(pending_with_copy), amt(pending_with_copy)),
+        ("  No Copy on File",                  len(pending_no_copy), amt(pending_no_copy)),
+        ("", None, None),
+        ("To Review",                          None, None),
+        ("  Amount Mismatch",                  len(mismatch), mismatch_amt),
+        ("  PO Mismatch",                      len(po_mism), amt(po_mism)),
+    ]
+
+
+def make_recon_report(buckets: dict, statement_total: float, grand_total: "float | None") -> bytes:
+    """Build the downloadable Excel report: a Summary sheet (hierarchical
+    counts/totals plus the statement-total sanity check) plus one sheet per
+    category."""
     sheet_specs = [
-        ("Conciliado",              buckets["matched"]),
-        ("Discrepancia Monto",      buckets["amount_mismatch"]),
-        ("Pendiente de Registrar",  buckets["pending_register"]),
-        ("Sin Copia",               buckets["no_copy"]),
-        ("Discrepancia PO",         buckets["po_mismatch"]),
+        ("Matched",              buckets["matched"]),
+        ("Amount Mismatch",      buckets["amount_mismatch"]),
+        ("Pending Registration", buckets["pending_registration"]),
+        ("PO Mismatch",          buckets["po_mismatch"]),
     ]
     cols = [
         "invoice_no", "type", "invoice_date", "po_ref", "amount", "day",
         "registered", "system_total", "costctr", "paid", "payment_date",
-        "has_copy", "extraction_po", "location", "filename",
+        "has_copy", "extraction_po", "location", "po_mismatch", "filename",
     ]
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary_rows = [
-            {"Categoría": label, "Cantidad de facturas": len(rows),
-             "Monto total (CAD)": round(sum((r.get("amount") or 0) for r in rows), 2)}
-            for label, rows in sheet_specs
+            {"Category": label, "Invoice Count": count, "Total Amount (CAD)": amount}
+            for label, count, amount in build_recon_summary_rows(buckets, statement_total)
         ]
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen", index=False)
+        summary_rows.append({"Category": "", "Invoice Count": None, "Total Amount (CAD)": None})
+        summary_rows.append({
+            "Category": "Statement Total (per file)" if grand_total is not None
+                        else "Statement Total (not found in file)",
+            "Invoice Count": None,
+            "Total Amount (CAD)": grand_total,
+        })
+        summary_rows.append({
+            "Category": "Sum of Parsed Invoice Lines",
+            "Invoice Count": None,
+            "Total Amount (CAD)": round(statement_total, 2),
+        })
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
         for label, rows in sheet_specs:
             if rows:
                 df = pd.DataFrame(rows)
@@ -2603,18 +2690,17 @@ if active_module == "recon":
 
     vendor_keys = list(RECON_VENDORS.keys())
     recon_vendor = st.selectbox(
-        "1️⃣ Proveedor a conciliar",
+        "1️⃣ Vendor to reconcile",
         vendor_keys,
         format_func=lambda k: RECON_VENDORS[k]["label"],
     )
     st.caption(
-        "El extracto del sistema y el excel de extracción de copias ya vienen "
-        "filtrados a este proveedor cuando los exportás — no se aplica ningún "
-        "filtro adicional por nombre; el proveedor solo determina qué plantilla "
-        "se usa para leer el **statement**."
+        "The system extract and the invoice-copy tracking Excel are already scoped to "
+        "this vendor when you export them — no extra filtering by name is applied; the "
+        "vendor selection only decides which template is used to read the **statement**."
     )
 
-    st.markdown("**2️⃣ Adjuntar soportes**")
+    st.markdown("**2️⃣ Attach supporting files**")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         recon_statement_file = st.file_uploader(
@@ -2651,7 +2737,7 @@ if active_module == "recon":
     if do_recon:
         try:
             parse_statement = RECON_VENDORS[recon_vendor]["parse_statement"]
-            statement = parse_statement(
+            statement, grand_total = parse_statement(
                 recon_statement_file.name, recon_statement_file.read()
             )
             system = parse_system_extract(recon_system_file.read())
@@ -2663,39 +2749,48 @@ if active_module == "recon":
                 st.error("Could not find any invoice lines in the statement. Check the file format.")
             else:
                 buckets = reconcile_atlantic_statement(statement, system, extraction)
+                statement_total = sum((r.get("amount") or 0) for r in statement)
                 st.session_state.recon_results = buckets
-                st.session_state.recon_zip = make_recon_report(buckets)
+                st.session_state.recon_statement_total = statement_total
+                st.session_state.recon_grand_total = grand_total
+                st.session_state.recon_zip = make_recon_report(buckets, statement_total, grand_total)
         except Exception as e:
             st.error(f"Error during reconciliation: {e}")
 
     buckets = st.session_state.recon_results
     if buckets:
-        n_matched   = len(buckets["matched"])
-        n_amount    = len(buckets["amount_mismatch"])
-        n_pending   = len(buckets["pending_register"])
-        n_no_copy   = len(buckets["no_copy"])
-        n_po        = len(buckets["po_mismatch"])
-        n_total     = n_matched + n_amount + n_pending + n_no_copy
+        statement_total = st.session_state.recon_statement_total
+        grand_total = st.session_state.recon_grand_total
+        if grand_total is not None:
+            diff = round(statement_total - grand_total, 2)
+            if abs(diff) <= 0.02:
+                st.success(
+                    f"✅ Statement total matches: file says **CAD {grand_total:,.2f}**, "
+                    f"parsed lines add up to **CAD {statement_total:,.2f}**."
+                )
+            else:
+                st.error(
+                    f"⚠️ Statement total does **not** match: file says **CAD {grand_total:,.2f}**, "
+                    f"parsed lines add up to **CAD {statement_total:,.2f}** (difference "
+                    f"**CAD {diff:,.2f}**) — the file may not have been read correctly."
+                )
+        else:
+            st.warning(
+                f"Could not find a 'Total Owing' figure in the file to check against — "
+                f"parsed lines add up to **CAD {statement_total:,.2f}**."
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
-        stat_cols = st.columns(5)
-        stats = [
-            ("Total facturas", n_total, "blue"),
-            ("Conciliadas", n_matched, "green"),
-            ("Monto no coincide", n_amount, "red"),
-            ("Pendiente de registrar", n_pending, "amber"),
-            ("Sin copia", n_no_copy, "red"),
-        ]
-        for col, (label, num, color) in zip(stat_cols, stats):
-            with col:
-                st.markdown(
-                    f"<div class='stat-box'><div class='stat-num {color}'>{num}</div>"
-                    f"<div class='stat-lbl'>{label}</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-        if n_po:
-            st.warning(f"⚠️ {n_po} factura(s) con PO distinto entre el statement y el nombre del archivo.")
+        summary_df = pd.DataFrame(
+            [
+                (label,
+                 "" if count is None else f"{count:,}",
+                 "" if amount is None else f"{amount:,.2f}")
+                for label, count, amount in build_recon_summary_rows(buckets, statement_total)
+            ],
+            columns=["Category", "Invoice Count", "Amount (CAD)"],
+        )
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
         st.download_button(
             "⬇️ Download Reconciliation Report (Excel)",
@@ -2703,30 +2798,12 @@ if active_module == "recon":
             file_name=f"atlantic_reconciliation_{date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=False,
+            type="primary",
         )
-
-        tab_labels = [
-            f"✅ Conciliadas ({n_matched})",
-            f"❌ Monto no coincide ({n_amount})",
-            f"🕓 Pendiente de registrar ({n_pending})",
-            f"🚨 Sin copia ({n_no_copy})",
-            f"🔀 PO no coincide ({n_po})",
-        ]
-        tabs = st.tabs(tab_labels)
-        bucket_keys = ["matched", "amount_mismatch", "pending_register", "no_copy", "po_mismatch"]
-        display_cols = [
-            "invoice_no", "invoice_date", "po_ref", "amount", "system_total",
-            "registered", "paid", "has_copy", "extraction_po", "location",
-        ]
-        for tab, key in zip(tabs, bucket_keys):
-            with tab:
-                rows = buckets[key]
-                if not rows:
-                    st.info("Nothing here.")
-                else:
-                    df = pd.DataFrame(rows)
-                    df = df[[c for c in display_cols if c in df.columns]]
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(
+            "Full invoice-level detail (including the **has copy** and **PO mismatch** "
+            "columns on the Pending Registration sheet) is in the Excel report."
+        )
     elif not (recon_statement_file or recon_system_file):
         st.info("📂 Upload the statement and the system extract to run the reconciliation.")
 
