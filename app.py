@@ -95,6 +95,7 @@ VENDOR_EXCEPCION = "0101000390"
 # ─────────────────────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
+        "active_module":       None,
         "proveedores":         copy.deepcopy(DEFAULT_PROVEEDORES),
         "gl_codes":            copy.deepcopy(DEFAULT_GL_CODES),
         "usuarios":            DEFAULT_USERS.copy(),
@@ -1177,13 +1178,49 @@ st.markdown("""
     border-left-color: #ffc107 !important;
     background: #fffdf0 !important;
 }
+.module-card [data-testid="stVerticalBlockBorderWrapper"] {
+    transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.module-card:hover [data-testid="stVerticalBlockBorderWrapper"] {
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+    transform: translateY(-2px);
+}
+.module-icon { font-size: 34px; line-height: 1; }
+.module-label { font-size: 17px; font-weight: 700; margin-top: 6px; }
+.module-desc  { font-size: 13px; color: #6c757d; margin-top: 2px; min-height: 34px; }
 </style>
 """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE REGISTRY
+# ─────────────────────────────────────────────────────────────────────────────
+MODULES = [
+    {"key": "splitter", "icon": "✂️",  "label": "Invoice Splitter",  "desc": "Split batch PDFs into individual invoice files."},
+    {"key": "matcher",  "icon": "🔗", "label": "Invoice Matcher",   "desc": "Match invoices with POs and merge into one PDF."},
+    {"key": "coding",   "icon": "🏷️",  "label": "Invoice Coding",    "desc": "Stamp GL / Cost Centre codes on invoices."},
+    {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
+    {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
+    {"key": "payment",  "icon": "💳", "label": "Payment Packager",  "desc": "Bundle invoices into payment batches."},
+    {"key": "database", "icon": "🗄️",  "label": "Database",          "desc": "Manage vendors, GL codes & users."},
+    {"key": "settings", "icon": "⚙️",  "label": "Settings",          "desc": "Configure the coding stamp position."},
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("## 📂 Modules")
+    nav_labels = ["🏠 Home"] + [f"{m['icon']} {m['label']}" for m in MODULES]
+    nav_keys   = [None] + [m["key"] for m in MODULES]
+    nav_idx    = nav_keys.index(st.session_state.active_module) \
+        if st.session_state.active_module in nav_keys else 0
+    picked = st.selectbox("Go to", nav_labels, index=nav_idx, label_visibility="collapsed")
+    picked_key = nav_keys[nav_labels.index(picked)]
+    if picked_key != st.session_state.active_module:
+        st.session_state.active_module = picked_key
+        st.rerun()
+
+    st.divider()
     st.markdown("## ⚙️ Work Session")
 
     user_list = st.session_state.usuarios + ["✏️ Other..."]
@@ -1246,26 +1283,50 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN HEADER
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<h1 style='margin-bottom:0'>📄 Atlantic — Invoice Tools</h1>
-<p style='color:gray;margin-top:4px'>Invoice Splitter &nbsp;·&nbsp; Invoice &amp; PO Matcher &nbsp;·&nbsp; Invoice Codifier</p>
-""", unsafe_allow_html=True)
+active_module = st.session_state.active_module
 
-tab_split, tab_match, tab_cod, tab_couru, tab_audit, tab_pay, tab_db, tab_cfg = st.tabs([
-    "✂️  Invoice Splitter",
-    "🔗  Invoice Matcher",
-    "🏷️  Invoice Coding",
-    "📊  Couru Code",
-    "🔍  AP Audit",
-    "💳  Payment Packager",
-    "🗄️  Database",
-    "⚙️  Settings",
-])
+if active_module is None:
+    st.markdown("""
+    <h1 style='margin-bottom:0'>📄 Atlantic — Invoice Tools</h1>
+    <p style='color:gray;margin-top:4px'>Pick a module to get started</p>
+    """, unsafe_allow_html=True)
+
+    n_cols = 4
+    rows = [MODULES[i:i + n_cols] for i in range(0, len(MODULES), n_cols)]
+    for row in rows:
+        cols = st.columns(n_cols)
+        for col, mod in zip(cols, row):
+            with col:
+                st.markdown('<div class="module-card">', unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div class='module-icon'>{mod['icon']}</div>"
+                        f"<div class='module-label'>{mod['label']}</div>"
+                        f"<div class='module-desc'>{mod['desc']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open →", key=f"open_{mod['key']}", use_container_width=True):
+                        st.session_state.active_module = mod["key"]
+                        st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+else:
+    active_mod = next(m for m in MODULES if m["key"] == active_module)
+    col_home, col_title = st.columns([1, 6])
+    with col_home:
+        if st.button("🏠 Home", use_container_width=True):
+            st.session_state.active_module = None
+            st.rerun()
+    with col_title:
+        st.markdown(
+            f"<h2 style='margin:2px 0 0 0'>{active_mod['icon']} {active_mod['label']}</h2>",
+            unsafe_allow_html=True,
+        )
+    st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — INVOICE SPLITTER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_split:
+if active_module == "splitter":
     st.subheader("✂️ Split Batch Invoice PDFs")
     st.markdown(
         "Upload one or more **batch PDFs** from Atlantic (each may contain multiple invoices). "
@@ -1404,7 +1465,7 @@ with tab_split:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — INVOICE MATCHER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_match:
+if active_module == "matcher":
     st.subheader("🔗 Invoice & PO Matcher")
     st.markdown(
         "Upload your invoice PDFs and your PO (Purchase Order) PDFs. "
@@ -1571,7 +1632,7 @@ with tab_match:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — INVOICE CODING (upload + review + results unified)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_cod:
+if active_module == "coding":
     if "upload_key" not in st.session_state:
         st.session_state.upload_key = 0
 
@@ -1877,7 +1938,7 @@ with tab_cod:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — COURU CODE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_couru:
+if active_module == "couru":
     st.subheader("📊 Couru Code — Invoice Report")
     st.markdown(
         "Upload invoice PDFs to extract key data and download an Excel report "
@@ -1972,7 +2033,7 @@ with tab_couru:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — AP AUDIT VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_audit:
+if active_module == "audit":
     st.subheader("🔍 AP Audit Validation")
     st.markdown(
         "Cross-reference invoice PDFs against the **A/P Voucher Audit Listing** "
@@ -2226,7 +2287,7 @@ with tab_audit:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — PAYMENT PACKAGER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_pay:
+if active_module == "payment":
     st.subheader("💳 Payment Packager — Build the invoice packages for a payment run")
     st.markdown(
         "This tool works entirely through **upload / download** — it does **not** need access "
@@ -2580,7 +2641,7 @@ with tab_pay:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 7 — DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_db:
+if active_module == "database":
     db_t1, db_t2 = st.tabs(["🏢 Vendors / Cost Centres", "📊 GL Accounts"])
 
     with db_t1:
@@ -2694,7 +2755,7 @@ with tab_db:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 8 — SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_cfg:
+if active_module == "settings":
     st.subheader("General Settings")
     col1, col2 = st.columns(2)
 
