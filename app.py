@@ -1417,6 +1417,69 @@ def parse_proden_statement(filename: str, file_bytes: bytes) -> tuple:
     raise ValueError("Only PDF statements are supported for Proden right now.")
 
 
+def parse_distribution_proden_statement_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Parse a Distribution Proden Inc. 'État de compte' aging PDF — same
+    layout as Les Entreprises Proden's (see parse_proden_statement_pdf),
+    with two differences seen in practice:
+      - the PO# sometimes has spaces around the hyphen (e.g. 'ML - 320643'
+        instead of 'ML-320437'), so it's captured as everything between the
+        invoice # and the aging-days fraction rather than a single
+        whitespace-free token, then has its internal spaces stripped;
+      - invoice numbers are zero-padded to 6 digits on the statement
+        ('005201') but stored unpadded in the accounting system ('5201'),
+        so leading zeros are stripped for the lookup to match.
+    Distribution Proden splits its statement by branch/customer account, so
+    a reconciliation is normally built from several of these PDFs (one per
+    branch) parsed and combined by the caller before matching against a
+    single system extract.
+    """
+    records = []
+    grand_total = None
+    line_pat = re.compile(
+        r'^([A-Za-z]{3}-\d{2}-\d{2})\s+(\d{5,7})\s+(.+?)\s+\d+\s*/\s*\d+\s+([\d,]+\.\d{2})\s*$'
+    )
+    total_pat = re.compile(
+        r'^([\d,]+\.\d{2})\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s*$'
+    )
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if grand_total is None:
+                    m_tot = total_pat.match(line)
+                    if m_tot:
+                        grand_total = _recon_parse_amount(m_tot.group(1))
+                        continue
+                m = line_pat.match(line)
+                if not m:
+                    continue
+                date_str, inv_no, po_ref, amount_str = m.groups()
+                try:
+                    inv_date = datetime.strptime(date_str, "%b-%d-%y").date()
+                except ValueError:
+                    inv_date = None
+                records.append({
+                    "invoice_no": str(int(inv_no)),
+                    "type":       None,
+                    "po_ref":     re.sub(r'\s+', '', po_ref),
+                    "invoice_date": inv_date,
+                    "amount":     _recon_parse_amount(amount_str),
+                    "balance":    None,
+                    "day":        None,
+                })
+    return records, grand_total
+
+
+def parse_distribution_proden_statement(filename: str, file_bytes: bytes) -> tuple:
+    """Dispatch for Distribution Proden's statement. Only PDF has been seen
+    from this vendor so far."""
+    if filename.lower().endswith(".pdf"):
+        return parse_distribution_proden_statement_pdf(file_bytes)
+    raise ValueError("Only PDF statements are supported for Distribution Proden right now.")
+
+
 def parse_system_extract(file_bytes: bytes) -> dict:
     """
     Parse the accounting-system AP extract (any vendor — the export is the
@@ -1687,6 +1750,7 @@ RECON_VENDORS = {
     "atlantic": {"label": "Atlantic Packaging",  "parse_statement": parse_atlantic_statement, "check_po": True},
     "bourret":  {"label": "Transport Bourret",   "parse_statement": parse_bourret_statement,  "check_po": False},
     "proden":   {"label": "Les Entreprises Proden", "parse_statement": parse_proden_statement, "check_po": True},
+    "distribution_proden": {"label": "Distribution Proden", "parse_statement": parse_distribution_proden_statement, "check_po": True},
 }
 
 
@@ -2874,10 +2938,16 @@ if active_module == "recon":
     st.markdown("**2️⃣ Attach supporting files**")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        recon_statement_file = st.file_uploader(
+        recon_statement_files = st.file_uploader(
             "📄 Statement of Account (PDF or Excel)",
             type=["pdf", "xlsx"],
+            accept_multiple_files=True,
             key=f"recon_statement_{st.session_state.recon_upload_key}",
+        )
+        st.caption(
+            "Upload more than one file if the vendor splits its statement "
+            "(e.g. one per branch) — they'll be combined and reconciled "
+            "together against a single system extract."
         )
     with col_b:
         recon_system_file = st.file_uploader(
@@ -2896,7 +2966,7 @@ if active_module == "recon":
     with col_run:
         do_recon = st.button(
             "🧮 Reconcile", type="primary",
-            disabled=not (recon_statement_file and recon_system_file),
+            disabled=not (recon_statement_files and recon_system_file),
         )
     with col_clear:
         if st.button("🗑️ Clear", key="recon_clear"):
@@ -2909,16 +2979,24 @@ if active_module == "recon":
         try:
             vendor_cfg = RECON_VENDORS[recon_vendor]
             check_po = vendor_cfg.get("check_po", True)
-            statement, grand_total = vendor_cfg["parse_statement"](
-                recon_statement_file.name, recon_statement_file.read()
-            )
+            statement = []
+            grand_total = 0.0
+            grand_total_complete = True
+            for f in recon_statement_files:
+                file_records, file_grand_total = vendor_cfg["parse_statement"](f.name, f.read())
+                statement.extend(file_records)
+                if file_grand_total is None:
+                    grand_total_complete = False
+                else:
+                    grand_total += file_grand_total
+            grand_total = grand_total if grand_total_complete else None
             system = parse_system_extract(recon_system_file.read())
             extraction = (
                 parse_extraction_excel(recon_extraction_file.read())
                 if recon_extraction_file else {}
             )
             if not statement:
-                st.error("Could not find any invoice lines in the statement. Check the file format.")
+                st.error("Could not find any invoice lines in the statement(s). Check the file format.")
             else:
                 buckets = reconcile_statement(statement, system, extraction, check_po)
                 statement_total = sum((r.get("amount") or 0) for r in statement)
@@ -2969,7 +3047,7 @@ if active_module == "recon":
         st.download_button(
             "⬇️ Download Reconciliation Report (Excel)",
             data=st.session_state.recon_zip,
-            file_name=f"atlantic_reconciliation_{date.today().strftime('%Y%m%d')}.xlsx",
+            file_name=f"{recon_vendor}_reconciliation_{date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=False,
             type="primary",
@@ -2978,7 +3056,7 @@ if active_module == "recon":
             "Full invoice-level detail (including the **has copy** and **PO mismatch** "
             "columns on the Pending Registration sheet) is in the Excel report."
         )
-    elif not (recon_statement_file or recon_system_file):
+    elif not (recon_statement_files or recon_system_file):
         st.info("📂 Upload the statement and the system extract to run the reconciliation.")
 
 
