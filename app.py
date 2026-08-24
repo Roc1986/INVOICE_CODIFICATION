@@ -109,9 +109,10 @@ def init_state():
         "matcher_zip":         None,
         "matcher_upload_key":  0,
         # Splitter state
-        "splitter_results":    [],   # [{"filename", "pdf_bytes", "invoice_no", "cc", "bol", "pages", "warning"}]
+        "splitter_results":    [],   # [{"filename", "pdf_bytes", "invoice_no", "cc", "bol", "pages", "warning", "ocr_used"}]
         "splitter_zip":        None,
         "splitter_upload_key": 0,
+        "splitter_rotation":   0,    # rotation applied to scanned (OCR) batches
         # AP Audit state
         "audit_results":       None,
         "audit_data_count":    0,
@@ -162,8 +163,9 @@ def _splitter_extract_invoice_no(lines: list) -> str | None:
     """
     for i, line in enumerate(lines):
         if "INVOICE NO" in line.upper() and "FACTURE" in line.upper():
-            # Number at end of same line
-            m = re.search(r"(\d{7,10})\s*$", line)
+            # Number at end of same line (allow trailing OCR noise like a
+            # stray "-" or "=" picked up from a table border on scanned batches)
+            m = re.search(r"(\d{7,10})[^\d]*$", line)
             if m:
                 return m.group(1)
             # Number on any of the 4 preceding lines
@@ -182,7 +184,9 @@ def _splitter_extract_order_no(lines: list) -> str | None:
     Returns the full order number e.g. 'ML11465'.
     """
     for line in lines:
-        m = re.search(r"\d{6}\s+\d{2,3}\s+([A-Za-z]{2}\d{4,7})\b", line, re.IGNORECASE)
+        # \|?\s* tolerates a stray "|" the way OCR sometimes misreads the
+        # table's vertical grid line on scanned batches
+        m = re.search(r"\d{6}\s+\d{2,3}\s+\|?\s*([A-Za-z]{2}\d{4,7})\b", line, re.IGNORECASE)
         if m:
             return m.group(1).upper()
     return None
@@ -224,47 +228,122 @@ def _splitter_extract_bol(lines: list) -> str | None:
     return None
 
 
-def split_batch_pdf(pdf_bytes: bytes) -> list:
+def _splitter_render_page_image(pdf_bytes: bytes, page_no: int, dpi: int = 200):
+    """Render one 1-based page of a PDF to a PIL image, or None if OCR deps
+    are unavailable or rendering fails."""
+    if not OCR_AVAILABLE:
+        return None
+    try:
+        images = convert_from_bytes(pdf_bytes, first_page=page_no, last_page=page_no, dpi=dpi)
+    except Exception:
+        return None
+    return images[0] if images else None
+
+
+def _splitter_suggest_rotation(pdf_bytes: bytes, sample_pages: int = 3) -> int:
+    """
+    Best-effort guess at the page rotation needed for a scanned batch —
+    scanners commonly output pages sideways. Scores each candidate angle
+    (90/270 checked before 0/180, since a sideways scan is the far more
+    common case) by OCR-ing a few sample pages and rewarding a page whose
+    text actually matches the invoice-number pattern; this is only a
+    *default* — the UI shows thumbnails of all four candidates so the
+    user confirms or overrides it visually before anything is split.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    n = min(sample_pages, len(reader.pages))
+    if n == 0:
+        return 0
+
+    scores = {90: 0.0, 270: 0.0, 0: 0.0, 180: 0.0}
+    for page_no in range(1, n + 1):
+        img = _splitter_render_page_image(pdf_bytes, page_no, dpi=150)
+        if img is None:
+            continue
+        for angle in scores:
+            rimg = img.rotate(angle, expand=True) if angle else img
+            try:
+                text = pytesseract.image_to_string(rimg)
+            except Exception:
+                text = ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if _splitter_extract_invoice_no(lines):
+                scores[angle] += 20
+            t = text.upper()
+            if "INVOICE" in t:
+                scores[angle] += 3
+            if "FACTURE" in t:
+                scores[angle] += 3
+            if "ATLANTIC" in t:
+                scores[angle] += 1
+    return max(scores, key=scores.get)
+
+
+def split_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callback=None) -> list:
     """
     Split a multi-invoice Atlantic batch PDF into individual invoices.
+
+    Handles both regular (text-layer) batch PDFs and scanned batches with
+    no embedded text — those fall back to OCR automatically. `rotation`
+    (0/90/180/270) corrects pages that came out of the scanner sideways:
+    it's applied before OCR *and* baked into the output PDFs so the split
+    invoices open upright. progress_callback(page_no, total_pages), when
+    given, is called for each page while OCR is running (it's slow).
+
     Returns list of dicts:
-      { filename, pdf_bytes, invoice_no, cc, bol, pages (1-based), source_pages, warning }
+      { filename, pdf_bytes, invoice_no, cc, bol, pages (1-based),
+        source_pages, page_count, warning, ocr_used }
     """
-    reader   = PdfReader(BytesIO(pdf_bytes))
+    reader = PdfReader(BytesIO(pdf_bytes))
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        page_texts = [p.extract_text() or "" for p in pdf.pages]
+
+    total_pages = len(page_texts)
+    needs_ocr = OCR_AVAILABLE and len("".join(page_texts[:3]).strip()) < 30
+
+    if needs_ocr:
+        page_texts = []
+        for page_idx in range(total_pages):
+            if progress_callback:
+                progress_callback(page_idx + 1, total_pages)
+            img = _splitter_render_page_image(pdf_bytes, page_idx + 1, dpi=200)
+            if img is not None and rotation:
+                img = img.rotate(rotation, expand=True)
+            page_texts.append(pytesseract.image_to_string(img) if img is not None else "")
+
     invoices = []   # accumulated invoice dicts
     current  = None # {"number", "cc_raw", "bol", "pages": [0-based idx]}
 
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page_idx, page in enumerate(pdf.pages):
-            text  = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for page_idx, text in enumerate(page_texts):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-            is_continuation = (
-                "...Continued from previous page" in text
-                or "Continued from previous page" in text
-            )
+        is_continuation = (
+            "...Continued from previous page" in text
+            or "Continued from previous page" in text
+        )
 
-            if is_continuation and current is not None:
-                current["pages"].append(page_idx)
-                continue
+        if is_continuation and current is not None:
+            current["pages"].append(page_idx)
+            continue
 
-            inv_no = _splitter_extract_invoice_no(lines)
+        inv_no = _splitter_extract_invoice_no(lines)
 
-            if inv_no:
-                if current is not None:
-                    invoices.append(current)
-                order_no = _splitter_extract_order_no(lines)
-                cc_raw   = order_no[:2].upper() if order_no else None
-                bol      = _splitter_extract_bol(lines)
-                current  = {
-                    "number":  inv_no,
-                    "cc_raw":  cc_raw,
-                    "bol":     bol,
-                    "pages":   [page_idx],
-                }
-            elif current is not None:
-                # Page without a clear invoice marker — attach to current
-                current["pages"].append(page_idx)
+        if inv_no:
+            if current is not None:
+                invoices.append(current)
+            order_no = _splitter_extract_order_no(lines)
+            cc_raw   = order_no[:2].upper() if order_no else None
+            bol      = _splitter_extract_bol(lines)
+            current  = {
+                "number":  inv_no,
+                "cc_raw":  cc_raw,
+                "bol":     bol,
+                "pages":   [page_idx],
+            }
+        elif current is not None:
+            # Page without a clear invoice marker — attach to current
+            current["pages"].append(page_idx)
 
     if current is not None:
         invoices.append(current)
@@ -274,7 +353,14 @@ def split_batch_pdf(pdf_bytes: bytes) -> list:
     for inv in invoices:
         writer = PdfWriter()
         for p in inv["pages"]:
-            writer.add_page(reader.pages[p])
+            page = reader.pages[p]
+            if needs_ocr and rotation:
+                # `rotation` is expressed in PIL's counter-clockwise
+                # convention (it's what corrects the OCR preview image);
+                # pypdf's Page.rotate() is clockwise, so it needs the
+                # opposite angle to land on the same upright orientation.
+                page.rotate((-rotation) % 360)
+            writer.add_page(page)
         buf = BytesIO()
         writer.write(buf)
 
@@ -286,6 +372,8 @@ def split_batch_pdf(pdf_bytes: bytes) -> list:
             warn = "⚠️ Customer Order No. not detected — CC set to '??'"
         if inv["bol"] is None:
             warn = (warn or "") + "  ⚠️ Bill of Lading not detected — BOL set to '??'"
+        if needs_ocr:
+            warn = (warn or "") + "  📷 Read via OCR — please double-check the fields"
 
         results.append({
             "filename":     f"{inv_no} {cc} {bol}.pdf",
@@ -296,6 +384,7 @@ def split_batch_pdf(pdf_bytes: bytes) -> list:
             "source_pages": [p + 1 for p in inv["pages"]],
             "page_count":   len(inv["pages"]),
             "warning":      warn,
+            "ocr_used":     needs_ocr,
         })
 
     return results
@@ -1978,6 +2067,61 @@ if active_module == "splitter":
             st.rerun()
 
     if split_uploads:
+        # Scanned batches have no text layer — detect that up front (once
+        # per upload set) and, if found, offer a rotation preview/selector.
+        # Scanners often output pages sideways; getting this wrong would
+        # silently OCR (and save) every invoice upside down, so it's
+        # confirmed visually rather than fully automatic.
+        upload_sig = tuple((f.name, f.size) for f in split_uploads)
+        if st.session_state.get("_splitter_preview_sig") != upload_sig:
+            st.session_state["_splitter_preview_sig"] = upload_sig
+            scanned_bytes = None
+            for f in split_uploads:
+                fb = f.getvalue()
+                with pdfplumber.open(BytesIO(fb)) as pdf:
+                    sample_text = "".join((p.extract_text() or "") for p in pdf.pages[:3])
+                if len(sample_text.strip()) < 30:
+                    scanned_bytes = fb
+                    break
+            st.session_state["_splitter_scanned_sample"] = scanned_bytes
+            st.session_state["splitter_rotation"] = (
+                _splitter_suggest_rotation(scanned_bytes)
+                if scanned_bytes and OCR_AVAILABLE else 0
+            )
+
+        scanned_sample = st.session_state.get("_splitter_scanned_sample")
+        rotation = 0
+        if scanned_sample and OCR_AVAILABLE:
+            st.info(
+                "📷 Detected a scanned PDF (no digital text) — OCR will be used to read it. "
+                "**Click the thumbnail that looks upright** before splitting (applies to all "
+                "scanned files in this batch). The auto-suggested one is only a guess — "
+                "OCR can sometimes misread text even at the wrong angle, so please verify visually."
+            )
+            base_preview = _splitter_render_page_image(scanned_sample, 1, dpi=100)
+            rot_options = [0, 90, 180, 270]
+            if base_preview is not None:
+                thumb_cols = st.columns(4)
+                for col, angle in zip(thumb_cols, rot_options):
+                    with col:
+                        thumb = base_preview.rotate(angle, expand=True) if angle else base_preview
+                        st.image(thumb, caption=f"{angle}°" if angle else "0° (no change)",
+                                  use_container_width=True)
+            rotation = st.radio(
+                "Rotation to apply",
+                options=rot_options,
+                index=rot_options.index(st.session_state.get("splitter_rotation", 0)),
+                format_func=lambda a: f"{a}°" if a else "0° (no change)",
+                horizontal=True,
+                key="splitter_rotation_radio",
+            )
+            st.session_state["splitter_rotation"] = rotation
+        elif scanned_sample and not OCR_AVAILABLE:
+            st.warning(
+                "⚠️ This PDF looks scanned (no digital text) but OCR isn't available in "
+                "this environment — invoices won't be detected."
+            )
+
         do_split = st.button("✂️ Split Invoices", type="primary", use_container_width=False)
 
         if do_split:
@@ -1989,8 +2133,16 @@ if active_module == "splitter":
             for f_idx, f in enumerate(split_uploads):
                 prog.progress((f_idx) / len(split_uploads),
                               text=f"Splitting {f.name}…")
+
+                def _split_progress(cur_page, total_pg, _fname=f.name, _fi=f_idx):
+                    frac = (_fi + (cur_page / total_pg if total_pg else 1)) / len(split_uploads)
+                    prog.progress(min(frac, 0.999),
+                                  text=f"OCR {_fname}: page {cur_page}/{total_pg}…")
+
                 try:
-                    batch_results = split_batch_pdf(f.read())
+                    batch_results = split_batch_pdf(
+                        f.read(), rotation=rotation, progress_callback=_split_progress
+                    )
                     for r in batch_results:
                         r["source_file"] = f.name
                     all_results.extend(batch_results)
