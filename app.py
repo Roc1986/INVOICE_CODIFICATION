@@ -1569,6 +1569,71 @@ def parse_distribution_proden_statement(filename: str, file_bytes: bytes) -> tup
     raise ValueError("Only PDF statements are supported for Distribution Proden right now.")
 
 
+def parse_pyrogaz_statement_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Parse a Pyrogaz Inc. 'État de compte' aging PDF.
+    Each line looks like:
+      29/05/2026 023878 1442.52
+    (invoice date, invoice #, outstanding amount — printed in whichever of
+    the four aging-bucket columns applies: Courant / 30 jours / 60 jours /
+    90 jours, so exactly one amount appears per line). There is no PO /
+    customer-reference column at all (see check_po in RECON_VENDORS).
+    The footer prints the four bucket subtotals on one line, followed by
+    the grand total alone on the next line; the grand total is used for
+    the statement-total sanity check.
+    """
+    records = []
+    grand_total = None
+    line_pat = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d{5,7})\s+([\d,]+\.\d{2})\s*$')
+    subtotal_pat = re.compile(
+        r'^[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s*$'
+    )
+    grand_total_pat = re.compile(r'^([\d,]+\.\d{2})\s*$')
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            after_subtotal = False
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if subtotal_pat.match(line):
+                    after_subtotal = True
+                    continue
+                if after_subtotal:
+                    m_tot = grand_total_pat.match(line)
+                    if m_tot:
+                        grand_total = _recon_parse_amount(m_tot.group(1))
+                    after_subtotal = False
+                    continue
+                m = line_pat.match(line)
+                if not m:
+                    continue
+                date_str, inv_no, amount_str = m.groups()
+                try:
+                    inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+                except ValueError:
+                    inv_date = None
+                records.append({
+                    "invoice_no": inv_no,
+                    "type":       None,
+                    "po_ref":     None,
+                    "invoice_date": inv_date,
+                    "amount":     _recon_parse_amount(amount_str),
+                    "balance":    None,
+                    "day":        None,
+                })
+    return records, grand_total
+
+
+def parse_pyrogaz_statement(filename: str, file_bytes: bytes) -> tuple:
+    """Dispatch for Pyrogaz's statement. Only PDF has been seen from this
+    vendor so far."""
+    if filename.lower().endswith(".pdf"):
+        return parse_pyrogaz_statement_pdf(file_bytes)
+    raise ValueError("Only PDF statements are supported for Pyrogaz right now.")
+
+
 def parse_system_extract(file_bytes: bytes) -> dict:
     """
     Parse the accounting-system AP extract (any vendor — the export is the
@@ -1840,6 +1905,7 @@ RECON_VENDORS = {
     "bourret":  {"label": "Transport Bourret",   "parse_statement": parse_bourret_statement,  "check_po": False},
     "proden":   {"label": "Les Entreprises Proden", "parse_statement": parse_proden_statement, "check_po": True},
     "distribution_proden": {"label": "Distribution Proden", "parse_statement": parse_distribution_proden_statement, "check_po": True},
+    "pyrogaz":  {"label": "Pyrogaz Inc.",       "parse_statement": parse_pyrogaz_statement,  "check_po": False},
 }
 
 
