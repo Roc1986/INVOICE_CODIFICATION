@@ -1581,6 +1581,9 @@ def parse_pyrogaz_statement_pdf(pdf_bytes: bytes) -> tuple:
     The footer prints the four bucket subtotals on one line, followed by
     the grand total alone on the next line; the grand total is used for
     the statement-total sanity check.
+    Invoice numbers are zero-padded to 6 digits on the statement ('023878')
+    but stored unpadded in the accounting system ('23878'), same as
+    Distribution Proden — leading zeros are stripped for the lookup to match.
     """
     records = []
     grand_total = None
@@ -1615,7 +1618,7 @@ def parse_pyrogaz_statement_pdf(pdf_bytes: bytes) -> tuple:
                 except ValueError:
                     inv_date = None
                 records.append({
-                    "invoice_no": inv_no,
+                    "invoice_no": str(int(inv_no)),
                     "type":       None,
                     "po_ref":     None,
                     "invoice_date": inv_date,
