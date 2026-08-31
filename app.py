@@ -1952,6 +1952,17 @@ def _cf_next_id() -> int:
     return nid
 
 
+def _cf_build_nom_pdf(fournisseur, nro_facture, division, po_reception) -> str:
+    """
+    Auto-generate the invoice's PDF filename from its own fields — nombre
+    corto del proveedor, número de factura, división y PO — instead of it
+    being typed by hand. Mirrors the naming convention already used for
+    invoice copies (e.g. 'UBA 000028314 EV MD552802.pdf').
+    """
+    parts = [str(p).strip() for p in (fournisseur, nro_facture, division, po_reception) if str(p or "").strip()]
+    return (" ".join(parts) + ".pdf") if parts else ""
+
+
 def _cf_proveedor_lookup(codigo: str):
     codigo = str(codigo or "").strip().upper()
     for p in st.session_state.cf_proveedores:
@@ -2031,6 +2042,8 @@ def _cf_import_legacy_excel(file_bytes: bytes) -> dict:
                     seen_responsables.add(responsable)
                 if etat:
                     seen_estados.add(etat)
+                division = str(gv(row_vals, "DIVISION") or "").strip()
+                po_reception = str(gv(row_vals, "PO - Reception") or "").strip()
                 new_facturas.append({
                     # A full import REPLACES the list, so the id is just the
                     # row's position — matching the Excel's own correlativo
@@ -2042,8 +2055,8 @@ def _cf_import_legacy_excel(file_bytes: bytes) -> dict:
                     "nro_vendor":          str(gv(row_vals, "NRO FOURNISSEUR") or "").strip(),
                     "nro_facture":         str(nro_facture or "").strip(),
                     "date_facture":        _cf_fmt_date(gv(row_vals, "DATE FACTURE")),
-                    "division":            str(gv(row_vals, "DIVISION") or "").strip(),
-                    "po_reception":        str(gv(row_vals, "PO - Reception") or "").strip(),
+                    "division":            division,
+                    "po_reception":        po_reception,
                     "responsable":         responsable,
                     "etat":                etat,
                     "problema":            False,
@@ -2052,7 +2065,7 @@ def _cf_import_legacy_excel(file_bytes: bytes) -> dict:
                     "ultima_actualizacion": _cf_fmt_date(gv(row_vals, "Dernier Misa a jour")),
                     "poste":               bool(gv(row_vals, "POSTÉ")),
                     "payee":               False,  # legacy column was #REF! on every row — starts clean
-                    "nom_pdf":             str(gv(row_vals, "NOM PDF") or "").strip(),
+                    "nom_pdf":             _cf_build_nom_pdf(fournisseur, nro_facture, division, po_reception),
                     "cc":                  str(gv(row_vals, "CC") or "").strip(),
                     "gl":                  str(gv(row_vals, "GL") or "").strip(),
                     "monto":               prix if isinstance(prix, (int, float)) else None,
@@ -4184,19 +4197,21 @@ if active_module == "control_prov":
                 with qa3:
                     qa_resp = st.selectbox("Responsable", [""] + resp_options, key="cf_qa_resp")
                     qa_estado = st.selectbox("Estado", [""] + estado_options, key="cf_qa_estado")
-                    qa_nom_pdf = st.text_input("Nombre PDF (opcional)", key="cf_qa_nom_pdf")
 
                 qa_p = _cf_proveedor_lookup(qa_prov) if qa_prov else None
                 if qa_p:
                     st.caption(f"↳ {qa_p.get('nombre', '')} · # Vendor {qa_p.get('vendor_no', '')}")
                 elif qa_prov:
                     st.caption("↳ Proveedor no encontrado en la base — completalo en la pestaña Proveedores.")
+                st.caption("El **Nombre PDF** se arma solo: Proveedor + Nro. Factura + División + PO.")
 
                 if st.form_submit_button("➕ Agregar (Ajouter)", type="primary"):
                     if not qa_prov or not qa_nro_facture.strip():
                         st.error("Completá al menos Proveedor y Nro. Factura.")
                     else:
                         today_str = date.today().isoformat()
+                        qa_division_v = qa_division.strip()
+                        qa_po_v = qa_po.strip()
                         new_row = {
                             "id":                   _cf_next_id(),
                             "fournisseur":          qa_prov,
@@ -4204,8 +4219,8 @@ if active_module == "control_prov":
                             "nro_vendor":           qa_p.get("vendor_no", "") if qa_p else "",
                             "nro_facture":          qa_nro_facture.strip(),
                             "date_facture":         qa_date_facture.isoformat(),
-                            "division":             qa_division.strip(),
-                            "po_reception":         qa_po.strip(),
+                            "division":             qa_division_v,
+                            "po_reception":         qa_po_v,
                             "responsable":          qa_resp,
                             "etat":                 qa_estado,
                             "problema":             False,
@@ -4214,7 +4229,7 @@ if active_module == "control_prov":
                             "date_reception":       today_str,
                             "poste":                False,
                             "payee":                False,
-                            "nom_pdf":              qa_nom_pdf.strip(),
+                            "nom_pdf":              _cf_build_nom_pdf(qa_prov, qa_nro_facture.strip(), qa_division_v, qa_po_v),
                             "cc":                   "",
                             "gl":                   "",
                             "monto":                qa_monto or None,
@@ -4266,7 +4281,10 @@ if active_module == "control_prov":
                 "date_reception": st.column_config.TextColumn("Fecha recepción (AAAA-MM-DD)"),
                 "poste":          st.column_config.CheckboxColumn("Posté"),
                 "payee":          st.column_config.CheckboxColumn("Payée"),
-                "nom_pdf":        st.column_config.TextColumn("Nombre PDF"),
+                "nom_pdf":        st.column_config.TextColumn(
+                    "Nombre PDF", disabled=True,
+                    help="Se arma solo: Proveedor + Nro. Factura + División + PO",
+                ),
                 "cc":             st.column_config.TextColumn("CC"),
                 "gl":             st.column_config.TextColumn("GL"),
                 "monto":          st.column_config.NumberColumn("Monto + impuestos", format="%.2f"),
@@ -4300,6 +4318,11 @@ if active_module == "control_prov":
                         "payee": bool(r.get("payee")),
                         "problema": bool(r.get("problema")),
                         "ultima_actualizacion": ultima,
+                        # Nombre PDF is never typed by hand — always rebuilt
+                        # from the row's own Proveedor/Factura/División/PO.
+                        "nom_pdf": _cf_build_nom_pdf(
+                            r.get("fournisseur"), r.get("nro_facture"), r.get("division"), r.get("po_reception")
+                        ),
                     })
                 st.session_state.cf_facturas = new_rows
                 st.success(f"✅ {len(new_rows)} facturas guardadas")
