@@ -17,6 +17,7 @@ import json
 import pandas as pd
 from datetime import date, datetime, timedelta
 import openpyxl
+from PIL import Image, ImageDraw
 
 # ── Optional OCR support ──────────────────────────────────────────────────────
 try:
@@ -90,6 +91,18 @@ DEFAULT_GL_CODES = [
 DEFAULT_USERS = ["ROC", "MLE", "PD"]
 VENDOR_EXCEPCION = "0101000390"
 
+# Control Facturas — Otros Proveedores: default workflow states. Any value
+# already used in imported/legacy data is added on top of this list rather
+# than replacing it, so nothing typed before gets orphaned.
+CF_DEFAULT_ESTADOS = [
+    "Pendiente de codificación",
+    "Codificada - pendiente de sello",
+    "Sellada - enviada a aprobación",
+    "Aprobada",
+    "Pagada",
+    "Con problema",
+]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,6 +140,18 @@ def init_state():
         "recon_statement_total":   None,
         "recon_grand_total":       None,
         "recon_check_po":          True,
+        # Control Facturas — Otros Proveedores (non-Atlantic) state
+        "cf_facturas":              [],   # invoice reception/coding registry
+        "cf_proveedores":           [],   # vendor catalogue
+        "cf_reglas":                [],   # per-vendor GL/CC special rules
+        "cf_responsables":          [],   # editable list of people who can be assigned
+        "cf_estados":               CF_DEFAULT_ESTADOS.copy(),  # editable status list
+        "cf_next_id":               1,
+        "cf_stamp_x":               40,
+        "cf_stamp_y":               40,
+        "cf_stamp_w":               230,
+        "cf_stamp_h":               110,
+        "cf_stamped_result":        None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1913,6 +1938,254 @@ RECON_VENDORS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONTROL FACTURAS — OTROS PROVEEDORES (non-Atlantic vendors)
+# Reception / coding / vendor-control tool, replacing a fragile shared .xlsm
+# that relied on VBA, a live link into a 105k-row external workbook, and a
+# Power Query folder scan over a network share.
+# ─────────────────────────────────────────────────────────────────────────────
+CF_KNOWN_LEGACY_SHEETS = {"CONTROL", "FOURNISSEUR", "BASE", "VALIDATION"}
+
+
+def _cf_next_id() -> int:
+    nid = st.session_state.cf_next_id
+    st.session_state.cf_next_id += 1
+    return nid
+
+
+def _cf_proveedor_lookup(codigo: str):
+    codigo = str(codigo or "").strip().upper()
+    for p in st.session_state.cf_proveedores:
+        if str(p.get("codigo", "")).strip().upper() == codigo:
+            return p
+    return None
+
+
+def _cf_fmt_date(v) -> str:
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    return str(v).strip() if v not in (None, "") else ""
+
+
+def _cf_import_legacy_excel(file_bytes: bytes) -> dict:
+    """
+    One-time migration of the user's existing CONTROL_FACTURES workbook
+    (CONTROL, FOURNISSEUR and any extra per-vendor rule sheet such as
+    'Xerox') into this app's own storage. Read-only — nothing is written
+    back to the uploaded file.
+    """
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    result = {"facturas": 0, "proveedores": 0, "reglas": 0, "responsables": 0, "estados": 0, "warnings": []}
+
+    if "FOURNISSEUR" in wb.sheetnames:
+        ws = wb["FOURNISSEUR"]
+        new_prov = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            codigo = row[0] if len(row) > 0 else None
+            nombre = row[1] if len(row) > 1 else None
+            # Some FOURNISSEUR sheets carry a small legend area (e.g. cells
+            # literally containing "Fournisseur" / "# Vendor" as labels,
+            # not data) above or beside the real vendor rows — a genuine
+            # vendor always has both a code and a name, so require both.
+            if codigo and str(codigo).strip() and nombre and str(nombre).strip():
+                new_prov.append({
+                    "codigo":     str(codigo).strip(),
+                    "nombre":     str(nombre).strip(),
+                    "vendor_no":  str(row[2]).strip() if len(row) > 2 and row[2] not in (None, "") else "",
+                    "divisiones": "",
+                    "activo":     True,
+                    "notas":      "",
+                })
+        if new_prov:
+            st.session_state.cf_proveedores = new_prov
+            result["proveedores"] = len(new_prov)
+
+    if "CONTROL" in wb.sheetnames:
+        ws = wb["CONTROL"]
+        header_row = None
+        for r in range(1, min(ws.max_row, 30) + 1):
+            vals = [c.value for c in ws[r]]
+            if "NRO FACTURE" in vals and "FOURNISSEUR" in vals:
+                header_row = r
+                break
+        if header_row:
+            headers = [str(c.value).strip() if c.value else "" for c in ws[header_row]]
+            col_idx = {h: i for i, h in enumerate(headers) if h}
+
+            def gv(row_vals, key, default=None):
+                i = col_idx.get(key)
+                return row_vals[i] if i is not None and i < len(row_vals) else default
+
+            new_facturas = []
+            seen_responsables, seen_estados = set(), set()
+            for row_vals in ws.iter_rows(min_row=header_row + 1, values_only=True):
+                fournisseur = gv(row_vals, "FOURNISSEUR")
+                nro_facture = gv(row_vals, "NRO FACTURE")
+                if not fournisseur and not nro_facture:
+                    continue
+                prix = gv(row_vals, "Prix A/T")
+                responsable = str(gv(row_vals, "Responsable") or "").strip()
+                etat = str(gv(row_vals, "ETAT") or "").strip()
+                if responsable:
+                    seen_responsables.add(responsable)
+                if etat:
+                    seen_estados.add(etat)
+                new_facturas.append({
+                    "id":             _cf_next_id(),
+                    "fournisseur":    str(fournisseur or "").strip(),
+                    "nom_system":     str(gv(row_vals, "NOM SYSTEM") or "").strip(),
+                    "nro_vendor":     str(gv(row_vals, "NRO FOURNISSEUR") or "").strip(),
+                    "nro_facture":    str(nro_facture or "").strip(),
+                    "date_facture":   _cf_fmt_date(gv(row_vals, "DATE FACTURE")),
+                    "division":       str(gv(row_vals, "DIVISION") or "").strip(),
+                    "po_reception":   str(gv(row_vals, "PO - Reception") or "").strip(),
+                    "responsable":    responsable,
+                    "etat":           etat,
+                    "problema":       False,
+                    "comentario":     str(gv(row_vals, "Coment") or "").strip(),
+                    "date_reception": _cf_fmt_date(gv(row_vals, "DATE RECEPTION")),
+                    "poste":          bool(gv(row_vals, "POSTÉ")),
+                    "payee":          False,  # legacy column was #REF! on every row — starts clean
+                    "nom_pdf":        str(gv(row_vals, "NOM PDF") or "").strip(),
+                    "cc":             str(gv(row_vals, "CC") or "").strip(),
+                    "gl":             str(gv(row_vals, "GL") or "").strip(),
+                    "monto":          prix if isinstance(prix, (int, float)) else None,
+                })
+            if new_facturas:
+                st.session_state.cf_facturas = new_facturas
+                result["facturas"] = len(new_facturas)
+            if seen_responsables:
+                existing = set(st.session_state.cf_responsables)
+                st.session_state.cf_responsables = sorted(existing | seen_responsables)
+                result["responsables"] = len(seen_responsables - existing)
+            if seen_estados:
+                existing = set(st.session_state.cf_estados)
+                st.session_state.cf_estados = st.session_state.cf_estados + sorted(seen_estados - existing)
+                result["estados"] = len(seen_estados - existing)
+        else:
+            result["warnings"].append("No se encontró la fila de encabezados (FOURNISSEUR / NRO FACTURE) en la hoja CONTROL.")
+
+    for sheet_name in wb.sheetnames:
+        if sheet_name in CF_KNOWN_LEGACY_SHEETS:
+            continue
+        ws = wb[sheet_name]
+        headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+        if "GL" not in headers or "CC" not in headers:
+            continue
+        col_idx = {h: i for i, h in enumerate(headers) if h}
+
+        def g(row_vals, key):
+            i = col_idx.get(key)
+            return row_vals[i] if i is not None and i < len(row_vals) else None
+
+        new_reglas = []
+        last_concept = ""
+        for row_vals in ws.iter_rows(min_row=2, values_only=True):
+            concept = g(row_vals, "Concept")
+            if concept:
+                last_concept = str(concept).strip()
+            gl_val, cc_val = g(row_vals, "GL"), g(row_vals, "CC")
+            if not gl_val and not cc_val:
+                continue
+            no_cliente = g(row_vals, "No. Client")
+            new_reglas.append({
+                "proveedor":  sheet_name,
+                "concepto":   last_concept,
+                "gl":         str(gl_val).strip() if gl_val not in (None, "") else "",
+                "cc":         str(cc_val).strip() if cc_val not in (None, "") else "",
+                "no_cliente": str(no_cliente).strip() if no_cliente not in (None, "") else "",
+                "notas":      "",
+            })
+        if new_reglas:
+            st.session_state.cf_reglas.extend(new_reglas)
+            result["reglas"] += len(new_reglas)
+
+    return result
+
+
+def _cf_create_stamp_pdf(lines: list, x: float, y: float, w: float, h: float, page_w: float, page_h: float) -> bytes:
+    """
+    Build a single-page PDF holding just the red-bordered coding stamp
+    (same look as the red box in E1:F7 of the legacy CONTROL sheet, and
+    the same visual style as the Atlantic coding stamp) at an arbitrary,
+    caller-chosen position — since non-Atlantic invoices don't share a
+    common layout, the position is picked by hand per invoice rather than
+    fixed in Settings.
+    """
+    packet = BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    y_bottom = page_h - y - h  # y is measured from the TOP, reportlab draws from the bottom
+    c.setStrokeColorRGB(0.85, 0.0, 0.0)
+    c.setFillColorRGB(1.0, 1.0, 1.0)
+    c.setLineWidth(1.8)
+    c.rect(x, y_bottom, w, h, fill=1)
+    c.setFillColorRGB(0.85, 0.0, 0.0)
+    c.setFont("Helvetica-Bold", 8.5)
+    pad = 8
+    line_h = (h - pad) / max(len(lines), 1)
+    tx, ty = x + pad, y_bottom + h - line_h
+    for i, line in enumerate(lines):
+        c.drawString(tx, ty - i * line_h, line)
+    c.save()
+    packet.seek(0)
+    return packet.read()
+
+
+def _cf_render_stamp_preview(pdf_bytes: bytes, x: float, y: float, w: float, h: float, dpi: int = 110) -> Image.Image:
+    """
+    Render the invoice's first page as an image with a translucent red box
+    overlaid where the stamp would land, so the position can be picked by
+    eye before committing — each vendor's invoice has its own layout, so
+    there's no fixed spot to default to. x/y/w/h are in PDF points
+    (x, y measured from the page's top-left corner).
+    """
+    images = convert_from_bytes(pdf_bytes, first_page=1, last_page=1, dpi=dpi)
+    img = images[0].convert("RGBA")
+    scale = dpi / 72
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    box = [x * scale, y * scale, (x + w) * scale, (y + h) * scale]
+    draw.rectangle(box, outline=(217, 0, 0, 255), width=3, fill=(217, 0, 0, 70))
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
+def _cf_cross_reference_ap(file_bytes: bytes, sheet_name: str, vendor_col: str, ref_col: str, match_col: str):
+    """
+    Fill in the PO/Reception of pending cf_facturas rows by matching
+    (vendor + reference) against an uploaded Purchases (AP) export.
+    Only the matched values are kept in cf_facturas — the uploaded
+    workbook itself is discarded by the caller once this returns.
+    """
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb[sheet_name]
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    headers = [str(c.value).strip() if c.value else "" for c in header_cells]
+    idx = {h: i for i, h in enumerate(headers)}
+    vi, ri, mi = idx.get(vendor_col), idx.get(ref_col), idx.get(match_col)
+    if vi is None or ri is None or mi is None:
+        return 0, ["No se encontraron las columnas indicadas en la hoja seleccionada."]
+
+    lookup = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if len(row) <= max(vi, ri, mi):
+            continue
+        key = f"{row[vi]} {row[ri]}".strip().upper()
+        if key and key not in lookup and row[mi] not in (None, ""):
+            lookup[key] = row[mi]
+
+    matched = 0
+    for f in st.session_state.cf_facturas:
+        if f.get("po_reception"):
+            continue
+        key = f"{f.get('fournisseur', '')} {f.get('nro_facture', '')}".strip().upper()
+        if key in lookup:
+            f["po_reception"] = str(lookup[key])
+            matched += 1
+    return matched, []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSS STYLES
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -1987,6 +2260,8 @@ MODULES = [
     {"key": "payment",  "icon": "💳", "label": "Payment Packager",  "desc": "Bundle invoices into payment batches."},
     {"key": "database", "icon": "🗄️",  "label": "Database",          "desc": "Manage vendors, GL codes & users."},
     {"key": "settings", "icon": "⚙️",  "label": "Settings",          "desc": "Configure the coding stamp position."},
+    {"key": "control_prov", "icon": "📋", "label": "Control Facturas — Otros Proveedores",
+     "desc": "Recepción, codificación y control de proveedores distintos a Atlantic."},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2042,9 +2317,14 @@ with st.sidebar:
 
     with st.expander("💾 Save / Load Database"):
         db_export = {
-            "proveedores": st.session_state.proveedores,
-            "gl_codes":    st.session_state.gl_codes,
-            "usuarios":    st.session_state.usuarios,
+            "proveedores":     st.session_state.proveedores,
+            "gl_codes":        st.session_state.gl_codes,
+            "usuarios":        st.session_state.usuarios,
+            "cf_facturas":     st.session_state.cf_facturas,
+            "cf_proveedores":  st.session_state.cf_proveedores,
+            "cf_reglas":       st.session_state.cf_reglas,
+            "cf_responsables": st.session_state.cf_responsables,
+            "cf_estados":      st.session_state.cf_estados,
         }
         st.download_button(
             "⬇️ Export DB (JSON)",
@@ -2057,9 +2337,18 @@ with st.sidebar:
         if db_upload:
             try:
                 db = json.loads(db_upload.read())
-                if "proveedores" in db: st.session_state.proveedores = db["proveedores"]
-                if "gl_codes"    in db: st.session_state.gl_codes    = db["gl_codes"]
-                if "usuarios"    in db: st.session_state.usuarios     = db["usuarios"]
+                if "proveedores"    in db: st.session_state.proveedores    = db["proveedores"]
+                if "gl_codes"       in db: st.session_state.gl_codes       = db["gl_codes"]
+                if "usuarios"       in db: st.session_state.usuarios       = db["usuarios"]
+                if "cf_facturas"     in db: st.session_state.cf_facturas     = db["cf_facturas"]
+                if "cf_proveedores"  in db: st.session_state.cf_proveedores  = db["cf_proveedores"]
+                if "cf_reglas"       in db: st.session_state.cf_reglas       = db["cf_reglas"]
+                if "cf_responsables" in db: st.session_state.cf_responsables = db["cf_responsables"]
+                if "cf_estados"      in db: st.session_state.cf_estados      = db["cf_estados"]
+                if db.get("cf_facturas"):
+                    st.session_state.cf_next_id = max(
+                        (r.get("id", 0) for r in db["cf_facturas"]), default=0
+                    ) + 1
                 st.success("✅ Database loaded")
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -3828,3 +4117,506 @@ if active_module == "settings":
         **GL codes in database:** {len(st.session_state.gl_codes)}
         **Users:** {', '.join(st.session_state.usuarios)}
         """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 9 — CONTROL FACTURAS (OTROS PROVEEDORES)
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "control_prov":
+    st.caption(
+        "Recepción, codificación y control de proveedores **distintos a Atlantic** — "
+        "carga manual de facturas (cada proveedor tiene su propio formato, así que no "
+        "se intenta leer los PDF automáticamente), catálogo de proveedores y "
+        "responsables, sello de codificación con posición ajustable a mano, y "
+        "seguimiento de estado."
+    )
+    cf_tabs = st.tabs([
+        "🧾 Recepción", "🏢 Proveedores", "👥 Responsables", "🏷️ Sello / Timbre",
+        "📋 Control", "📌 Reglas especiales (GL/CC)", "🔄 Cruce con compras (AP)",
+        "📥 Importar tu Excel actual",
+    ])
+
+    cf_columns = [
+        "id", "fournisseur", "nom_system", "nro_vendor", "nro_facture", "date_facture",
+        "division", "po_reception", "responsable", "etat", "problema", "comentario",
+        "date_reception", "poste", "payee", "nom_pdf", "cc", "gl", "monto",
+    ]
+
+    # ── Recepción ────────────────────────────────────────────────────────────
+    with cf_tabs[0]:
+        st.subheader("Recepción y codificación de facturas")
+        st.caption("Agregá cada factura a mano — como en la hoja CONTROL del Excel.")
+
+        prov_codes = sorted(
+            (set(p.get("codigo", "") for p in st.session_state.cf_proveedores)
+             | set(f.get("fournisseur", "") for f in st.session_state.cf_facturas))
+            - {""}
+        )
+        resp_options = sorted(
+            (set(st.session_state.cf_responsables)
+             | set(f.get("responsable", "") for f in st.session_state.cf_facturas))
+            - {""}
+        )
+        estado_options = sorted(
+            (set(st.session_state.cf_estados)
+             | set(f.get("etat", "") for f in st.session_state.cf_facturas))
+            - {""}
+        )
+
+        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+        with fcol1:
+            filt_prov = st.multiselect("Filtrar por proveedor", prov_codes, key="cf_filt_prov")
+        with fcol2:
+            filt_etat = st.multiselect("Filtrar por estado", estado_options, key="cf_filt_etat")
+        with fcol3:
+            filt_pend = st.checkbox("Solo pendientes de pago", key="cf_filt_pend")
+        with fcol4:
+            filt_problema = st.checkbox("Solo con problema", key="cf_filt_problema")
+
+        rows = st.session_state.cf_facturas
+        if filt_prov:
+            rows = [r for r in rows if r.get("fournisseur") in filt_prov]
+        if filt_etat:
+            rows = [r for r in rows if r.get("etat") in filt_etat]
+        if filt_pend:
+            rows = [r for r in rows if not r.get("payee")]
+        if filt_problema:
+            rows = [r for r in rows if r.get("problema")]
+
+        df = pd.DataFrame(rows, columns=cf_columns) if rows else pd.DataFrame(columns=cf_columns)
+
+        edited = st.data_editor(
+            df,
+            column_config={
+                "id":             st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                "fournisseur":    st.column_config.SelectboxColumn("Proveedor", options=prov_codes or [""]),
+                "nom_system":     st.column_config.TextColumn("Nombre sistema"),
+                "nro_vendor":     st.column_config.TextColumn("# Vendor"),
+                "nro_facture":    st.column_config.TextColumn("Nro. Factura"),
+                "date_facture":   st.column_config.TextColumn("Fecha factura (AAAA-MM-DD)"),
+                "division":       st.column_config.TextColumn("División"),
+                "po_reception":   st.column_config.TextColumn("PO / Recepción"),
+                "responsable":    st.column_config.SelectboxColumn("Responsable", options=resp_options or [""]),
+                "etat":           st.column_config.SelectboxColumn("Estado", options=estado_options or [""]),
+                "problema":       st.column_config.CheckboxColumn("¿Problema?"),
+                "comentario":     st.column_config.TextColumn("Comentario"),
+                "date_reception": st.column_config.TextColumn("Fecha recepción (AAAA-MM-DD)"),
+                "poste":          st.column_config.CheckboxColumn("Posté"),
+                "payee":          st.column_config.CheckboxColumn("Payée"),
+                "nom_pdf":        st.column_config.TextColumn("Nombre PDF"),
+                "cc":             st.column_config.TextColumn("CC"),
+                "gl":             st.column_config.TextColumn("GL"),
+                "monto":          st.column_config.NumberColumn("Monto + impuestos", format="%.2f"),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="cf_facturas_editor",
+            hide_index=True,
+        )
+
+        bcol1, bcol2 = st.columns([1, 2])
+        with bcol1:
+            if st.button("💾 Guardar cambios", type="primary", key="cf_save_facturas"):
+                new_rows = []
+                for r in edited.to_dict("records"):
+                    if not str(r.get("fournisseur") or "").strip() and not str(r.get("nro_facture") or "").strip():
+                        continue
+                    rid = r.get("id")
+                    rid = int(rid) if rid is not None and not pd.isna(rid) else _cf_next_id()
+                    new_rows.append({
+                        **r, "id": rid,
+                        "poste": bool(r.get("poste")),
+                        "payee": bool(r.get("payee")),
+                        "problema": bool(r.get("problema")),
+                    })
+                st.session_state.cf_facturas = new_rows
+                st.success(f"✅ {len(new_rows)} facturas guardadas")
+                st.rerun()
+        with bcol2:
+            if st.button("🔎 Autocompletar nombre / CC / GL", key="cf_autofill"):
+                n_name, n_gl = 0, 0
+                for r in st.session_state.cf_facturas:
+                    p = _cf_proveedor_lookup(r.get("fournisseur", ""))
+                    if p and not r.get("nom_system"):
+                        r["nom_system"] = p.get("nombre", "")
+                        n_name += 1
+                    if p and not r.get("nro_vendor"):
+                        r["nro_vendor"] = p.get("vendor_no", "")
+                    if not r.get("gl"):
+                        for reg in st.session_state.cf_reglas:
+                            if reg.get("proveedor") == r.get("fournisseur") and reg.get("cc") == (r.get("division") or r.get("cc")):
+                                r["cc"] = r.get("cc") or reg.get("cc", "")
+                                r["gl"] = reg.get("gl", "")
+                                n_gl += 1
+                                break
+                st.success(f"✅ {n_name} nombres y {n_gl} GL/CC completados")
+                st.rerun()
+
+        st.divider()
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total facturas", len(st.session_state.cf_facturas))
+        m2.metric("Pendientes de pago", sum(1 for r in st.session_state.cf_facturas if not r.get("payee")))
+        m3.metric("Con problema", sum(1 for r in st.session_state.cf_facturas if r.get("problema")))
+        m4.metric("Sin PDF registrado", sum(1 for r in st.session_state.cf_facturas if not r.get("nom_pdf")))
+        total_monto = sum(r.get("monto") or 0 for r in st.session_state.cf_facturas)
+        m5.metric("Monto total", f"${total_monto:,.2f}")
+
+    # ── Proveedores ──────────────────────────────────────────────────────────
+    with cf_tabs[1]:
+        st.subheader("Base de proveedores")
+        st.caption(
+            "Reemplaza la hoja **FOURNISSEUR** del Excel — nombre corto, nombre de "
+            "sistema y número de proveedor. Agregá una fila nueva con el **+** de abajo "
+            "de la tabla."
+        )
+        prov_cols = ["codigo", "nombre", "vendor_no", "divisiones", "activo", "notas"]
+        df_p = pd.DataFrame(st.session_state.cf_proveedores, columns=prov_cols) \
+            if st.session_state.cf_proveedores else pd.DataFrame(columns=prov_cols)
+        edited_p = st.data_editor(
+            df_p,
+            column_config={
+                "codigo":     st.column_config.TextColumn("Nombre corto", help="Código corto usado en Recepción, ej. 'D.Proden'"),
+                "nombre":     st.column_config.TextColumn("Nombre de sistema", help="Razón social tal como figura en el sistema contable"),
+                "vendor_no":  st.column_config.TextColumn("# Proveedor", help="Número de proveedor — solo dígitos (se guarda como texto para no perder ceros a la izquierda)"),
+                "divisiones": st.column_config.TextColumn("Divisiones (separadas por coma)"),
+                "activo":     st.column_config.CheckboxColumn("Activo"),
+                "notas":      st.column_config.TextColumn("Notas"),
+            },
+            num_rows="dynamic", use_container_width=True, key="cf_prov_editor", hide_index=True,
+        )
+        if st.button("💾 Guardar cambios — Proveedores", type="primary", key="cf_save_prov"):
+            new_p, non_numeric = [], []
+            for r in edited_p.to_dict("records"):
+                cod = r.get("codigo")
+                if cod and str(cod).strip():
+                    vendor_no = str(r.get("vendor_no") or "").strip()
+                    if vendor_no and not vendor_no.isdigit():
+                        non_numeric.append(f"{cod} ({vendor_no})")
+                    new_p.append({
+                        "codigo":     str(cod).strip(),
+                        "nombre":     str(r.get("nombre") or "").strip(),
+                        "vendor_no":  vendor_no,
+                        "divisiones": str(r.get("divisiones") or "").strip(),
+                        "activo":     bool(r.get("activo", True)),
+                        "notas":      str(r.get("notas") or "").strip(),
+                    })
+            st.session_state.cf_proveedores = new_p
+            st.success(f"✅ {len(new_p)} proveedores guardados")
+            if non_numeric:
+                st.warning("⚠️ El # Proveedor debería ser solo números — revisá: " + ", ".join(non_numeric))
+            st.rerun()
+
+    # ── Responsables ─────────────────────────────────────────────────────────
+    with cf_tabs[2]:
+        st.subheader("Responsables")
+        st.caption(
+            "Personas que pueden quedar asignadas a una factura en Recepción y Control. "
+            "Agregá o quitá nombres según haga falta."
+        )
+        df_resp = pd.DataFrame({"nombre": st.session_state.cf_responsables}) \
+            if st.session_state.cf_responsables else pd.DataFrame(columns=["nombre"])
+        edited_resp = st.data_editor(
+            df_resp,
+            column_config={"nombre": st.column_config.TextColumn("Nombre")},
+            num_rows="dynamic", use_container_width=True, key="cf_resp_editor", hide_index=True,
+        )
+        if st.button("💾 Guardar cambios — Responsables", type="primary", key="cf_save_resp"):
+            new_resp = sorted({
+                str(r.get("nombre") or "").strip()
+                for r in edited_resp.to_dict("records") if str(r.get("nombre") or "").strip()
+            })
+            st.session_state.cf_responsables = new_resp
+            st.success(f"✅ {len(new_resp)} responsables guardados")
+            st.rerun()
+
+    # ── Sello / Timbre ───────────────────────────────────────────────────────
+    with cf_tabs[3]:
+        st.subheader("Crear y colocar el sello de codificación")
+        st.caption(
+            "Genera el mismo sello rojo de la hoja CONTROL (Vendor / CC-GL / Periodo / "
+            "Prix A/T / PO-Recepción / Posted By) y lo coloca sobre la factura. Cada "
+            "proveedor tiene un formato distinto, así que la posición se ajusta a mano "
+            "con los controles — mirá la vista previa para encontrar un espacio en blanco."
+        )
+
+        st.markdown("**1. Datos del sello**")
+        picked_factura = None
+        if st.session_state.cf_facturas:
+            use_existing = st.checkbox(
+                "Completar con los datos de una factura ya registrada", value=True, key="cf_stamp_use_existing"
+            )
+        else:
+            use_existing = False
+
+        vendor_default = cc_default = gl_default = po_default = ""
+        monto_default = ""
+        resp_default = current_user
+
+        if use_existing:
+            options = {
+                f"{f.get('fournisseur','')} · {f.get('nro_facture','')} ({f.get('date_facture','')})": f
+                for f in st.session_state.cf_facturas
+            }
+            sel_label = st.selectbox("Factura", list(options.keys()), key="cf_stamp_pick")
+            picked_factura = options[sel_label]
+            vendor_default = picked_factura.get("nro_vendor", "")
+            cc_default      = picked_factura.get("cc", "")
+            gl_default      = picked_factura.get("gl", "")
+            po_default      = picked_factura.get("po_reception", "")
+            monto_default   = picked_factura.get("monto") or ""
+            resp_default    = picked_factura.get("responsable") or current_user
+
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            stamp_vendor = st.text_input("Vendor", value=str(vendor_default), key="cf_stamp_vendor")
+            stamp_cc = st.text_input("CC", value=str(cc_default), key="cf_stamp_cc")
+        with s2:
+            stamp_gl = st.text_input("GL", value=str(gl_default), key="cf_stamp_gl")
+            stamp_po = st.text_input("PO / Recepción", value=str(po_default), key="cf_stamp_po")
+        with s3:
+            stamp_periode = st.text_input("Periodo (MM - AAAA)", value=date.today().strftime("%m - %Y"), key="cf_stamp_periode")
+            stamp_monto = st.text_input("Prix A/T", value=str(monto_default), key="cf_stamp_monto")
+        stamp_posted_by = st.text_input("Posted By", value=str(resp_default), key="cf_stamp_posted_by")
+
+        cc_gl = f"{stamp_cc} - {stamp_gl}" if stamp_gl else stamp_cc
+        stamp_lines = [
+            f"VENDOR: {stamp_vendor}",
+            f"CC - GL: {cc_gl}",
+            f"PERIODE: {stamp_periode}",
+            f"PRIX A/T: {stamp_monto}",
+            f"PO-RECEPTION: {stamp_po}",
+            f"POSTED BY: {stamp_posted_by}",
+        ]
+
+        st.markdown("**2. Factura a sellar**")
+        stamp_pdf_up = st.file_uploader("PDF de la factura", type=["pdf"], key="cf_stamp_pdf_uploader")
+
+        if stamp_pdf_up:
+            pdf_bytes = stamp_pdf_up.getvalue()
+            page = PdfReader(BytesIO(pdf_bytes)).pages[0]
+            page_w = float(page.mediabox.width)
+            page_h = float(page.mediabox.height)
+
+            st.markdown("**3. Ajustá la posición del sello (buscá un espacio en blanco)**")
+            p1, p2 = st.columns(2)
+            with p1:
+                stamp_x = st.slider("X — desde la izquierda", 0, int(page_w),
+                                     min(st.session_state.cf_stamp_x, int(page_w)), key="cf_stamp_x_sl")
+                stamp_w = st.slider("Ancho", 120, 400, st.session_state.cf_stamp_w, key="cf_stamp_w_sl")
+            with p2:
+                stamp_y = st.slider("Y — desde arriba", 0, int(page_h),
+                                     min(st.session_state.cf_stamp_y, int(page_h)), key="cf_stamp_y_sl")
+                stamp_h = st.slider("Alto", 70, 220, st.session_state.cf_stamp_h, key="cf_stamp_h_sl")
+
+            try:
+                preview_img = _cf_render_stamp_preview(pdf_bytes, stamp_x, stamp_y, stamp_w, stamp_h)
+                st.image(preview_img, caption="Vista previa del sello sobre la factura", use_container_width=True)
+            except Exception as e:
+                st.warning(f"No se pudo generar la vista previa ({e}) — igual podés generar la factura sellada.")
+
+            update_registro = False
+            if picked_factura is not None:
+                update_registro = st.checkbox(
+                    f"Al generar, marcar esta factura como «Sellada - enviada a aprobación»",
+                    value=True, key="cf_stamp_update_estado",
+                )
+
+            if st.button("🏷️ Generar factura sellada", type="primary", key="cf_stamp_generate"):
+                stamp_bytes = _cf_create_stamp_pdf(stamp_lines, stamp_x, stamp_y, stamp_w, stamp_h, page_w, page_h)
+                stamped = stamp_pdf(pdf_bytes, stamp_bytes)
+                st.session_state.cf_stamp_x, st.session_state.cf_stamp_y = stamp_x, stamp_y
+                st.session_state.cf_stamp_w, st.session_state.cf_stamp_h = stamp_w, stamp_h
+                st.session_state.cf_stamped_result = {
+                    "bytes": stamped,
+                    "name": f"SELLADA_{re.sub(r'[^A-Za-z0-9_.-]+', '_', stamp_pdf_up.name)}",
+                }
+                if update_registro and picked_factura is not None:
+                    picked_factura["etat"] = "Sellada - enviada a aprobación"
+                    if "Sellada - enviada a aprobación" not in st.session_state.cf_estados:
+                        st.session_state.cf_estados.append("Sellada - enviada a aprobación")
+                st.rerun()
+
+        if st.session_state.cf_stamped_result:
+            res = st.session_state.cf_stamped_result
+            st.download_button(
+                "⬇️ Descargar factura sellada", data=res["bytes"], file_name=res["name"],
+                mime="application/pdf", key="cf_stamp_download", type="primary",
+            )
+
+    # ── Control ──────────────────────────────────────────────────────────────
+    with cf_tabs[4]:
+        st.subheader("Control y seguimiento de estado")
+        st.caption(
+            "Validá las facturas recibidas: filtrá y cambiá el estado o marcá si tienen "
+            "algún problema. Reemplaza la hoja VALIDATION del Excel."
+        )
+
+        cprov = sorted(set(f.get("fournisseur", "") for f in st.session_state.cf_facturas) - {""})
+        cestados = sorted((set(st.session_state.cf_estados)
+                            | set(f.get("etat", "") for f in st.session_state.cf_facturas)) - {""})
+        cresp = sorted((set(st.session_state.cf_responsables)
+                         | set(f.get("responsable", "") for f in st.session_state.cf_facturas)) - {""})
+
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            c_filt_prov = st.multiselect("Proveedor", cprov, key="cf_ctrl_filt_prov")
+        with cc2:
+            c_filt_estado = st.multiselect("Estado", cestados, key="cf_ctrl_filt_estado")
+        with cc3:
+            c_filt_problema = st.checkbox("Solo con problema", key="cf_ctrl_filt_problema")
+
+        rows = st.session_state.cf_facturas
+        if c_filt_prov:
+            rows = [r for r in rows if r.get("fournisseur") in c_filt_prov]
+        if c_filt_estado:
+            rows = [r for r in rows if r.get("etat") in c_filt_estado]
+        if c_filt_problema:
+            rows = [r for r in rows if r.get("problema")]
+
+        ctrl_cols = ["id", "fournisseur", "nro_facture", "date_reception", "responsable", "etat", "problema", "comentario"]
+        df_ctrl = pd.DataFrame(rows, columns=ctrl_cols) if rows else pd.DataFrame(columns=ctrl_cols)
+
+        edited_ctrl = st.data_editor(
+            df_ctrl,
+            column_config={
+                "id":             st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                "fournisseur":    st.column_config.TextColumn("Proveedor", disabled=True),
+                "nro_facture":    st.column_config.TextColumn("Nro. Factura", disabled=True),
+                "date_reception": st.column_config.TextColumn("Fecha recepción", disabled=True),
+                "responsable":    st.column_config.SelectboxColumn("Responsable", options=cresp or [""]),
+                "etat":           st.column_config.SelectboxColumn("Estado", options=cestados or [""]),
+                "problema":       st.column_config.CheckboxColumn("¿Problema?"),
+                "comentario":     st.column_config.TextColumn("Comentario"),
+            },
+            use_container_width=True, hide_index=True, key="cf_control_editor",
+        )
+
+        if st.button("💾 Guardar cambios de estado", type="primary", key="cf_save_control"):
+            by_id = {r["id"]: r for r in st.session_state.cf_facturas}
+            n = 0
+            for r in edited_ctrl.to_dict("records"):
+                rid = r.get("id")
+                if rid in by_id:
+                    by_id[rid]["responsable"] = r.get("responsable", "")
+                    by_id[rid]["etat"] = r.get("etat", "")
+                    by_id[rid]["problema"] = bool(r.get("problema"))
+                    by_id[rid]["comentario"] = r.get("comentario", "")
+                    n += 1
+            st.success(f"✅ {n} facturas actualizadas")
+            st.rerun()
+
+        st.divider()
+        cm1, cm2, cm3 = st.columns(3)
+        cm1.metric("Mostrando", len(rows))
+        cm2.metric("Con problema", sum(1 for r in st.session_state.cf_facturas if r.get("problema")))
+        cm3.metric("Sin estado asignado", sum(1 for r in st.session_state.cf_facturas if not r.get("etat")))
+
+        with st.expander("➕ Agregar un nuevo estado a la lista"):
+            new_estado = st.text_input("Nuevo estado", key="cf_new_estado_input")
+            if st.button("Agregar", key="cf_add_estado_btn") and new_estado.strip():
+                if new_estado.strip() not in st.session_state.cf_estados:
+                    st.session_state.cf_estados.append(new_estado.strip())
+                    st.success(f"✅ Estado «{new_estado.strip()}» agregado")
+                    st.rerun()
+
+    # ── Reglas especiales ────────────────────────────────────────────────────
+    with cf_tabs[5]:
+        st.subheader("Reglas especiales de GL / CC por proveedor")
+        st.caption(
+            "Generaliza la hoja **Xerox** del Excel a cualquier proveedor que tenga "
+            "varios GL/CC según concepto o división."
+        )
+        reglas_cols = ["proveedor", "concepto", "gl", "cc", "no_cliente", "notas"]
+        df_r = pd.DataFrame(st.session_state.cf_reglas, columns=reglas_cols) \
+            if st.session_state.cf_reglas else pd.DataFrame(columns=reglas_cols)
+        edited_r = st.data_editor(
+            df_r,
+            column_config={
+                "proveedor":  st.column_config.TextColumn("Proveedor"),
+                "concepto":   st.column_config.TextColumn("Concepto"),
+                "gl":         st.column_config.TextColumn("GL"),
+                "cc":         st.column_config.TextColumn("CC"),
+                "no_cliente": st.column_config.TextColumn("No. Cliente"),
+                "notas":      st.column_config.TextColumn("Notas"),
+            },
+            num_rows="dynamic", use_container_width=True, key="cf_reglas_editor", hide_index=True,
+        )
+        if st.button("💾 Guardar cambios — Reglas", type="primary", key="cf_save_reglas"):
+            new_r = []
+            for r in edited_r.to_dict("records"):
+                if str(r.get("proveedor") or "").strip():
+                    new_r.append({k: str(r.get(k) or "").strip() for k in reglas_cols})
+            st.session_state.cf_reglas = new_r
+            st.success(f"✅ {len(new_r)} reglas guardadas")
+            st.rerun()
+
+    # ── Cruce con compras (AP) ───────────────────────────────────────────────
+    with cf_tabs[6]:
+        st.subheader("Cruzar contra el archivo de compras (AP)")
+        st.caption(
+            "Reemplaza el link externo del Excel a `Fichier des achats - AP.xlsx` (105k filas). "
+            "Subí ese archivo cada vez que lo actualices — se usa solo para completar el "
+            "PO/Recepción de las facturas pendientes. **El archivo no se guarda**, solo el "
+            "resultado del cruce queda en el registro."
+        )
+        ap_up = st.file_uploader("Excel de compras (AP)", type=["xlsx", "xls"], key="cf_ap_uploader")
+        if ap_up:
+            ap_bytes = ap_up.read()
+            try:
+                wb_ap = openpyxl.load_workbook(BytesIO(ap_bytes), read_only=True, data_only=True)
+                sheet_sel = st.selectbox("Hoja", wb_ap.sheetnames, key="cf_ap_sheet")
+                header_cells = next(wb_ap[sheet_sel].iter_rows(min_row=1, max_row=1))
+                headers = [str(c.value).strip() if c.value else "" for c in header_cells]
+                headers = [h for h in headers if h]
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    vendor_col = st.selectbox("Columna con el proveedor", headers, key="cf_ap_vendor_col")
+                with c2:
+                    ref_col = st.selectbox("Columna con la factura/referencia", headers, key="cf_ap_ref_col")
+                with c3:
+                    match_col = st.selectbox("Columna a traer (PO / Recepción)", headers, key="cf_ap_match_col")
+
+                if st.button("🔄 Cruzar ahora", type="primary", key="cf_ap_cross"):
+                    matched, warnings = _cf_cross_reference_ap(ap_bytes, sheet_sel, vendor_col, ref_col, match_col)
+                    for w in warnings:
+                        st.error(w)
+                    if matched:
+                        st.success(f"✅ {matched} facturas actualizadas con su PO/Recepción")
+                        st.rerun()
+                    elif not warnings:
+                        st.info("No se encontraron coincidencias nuevas.")
+            except Exception as e:
+                st.error(f"No se pudo leer el archivo: {e}")
+            finally:
+                del ap_bytes
+
+    # ── Importar tu Excel actual ─────────────────────────────────────────────
+    with cf_tabs[7]:
+        st.subheader("Importar desde tu Excel actual (CONTROL_FACTURES)")
+        st.caption(
+            "Migra el contenido de tu archivo .xlsm/.xlsx actual (hojas CONTROL, FOURNISSEUR "
+            "y cualquier hoja de reglas especiales tipo 'Xerox') hacia esta base, incluyendo "
+            "los responsables y estados ya usados. Podés volver a ejecutarlo para reemplazar "
+            "todo con una versión más nueva del Excel."
+        )
+        legacy_up = st.file_uploader("Tu archivo Excel actual", type=["xlsm", "xlsx"], key="cf_legacy_uploader")
+        if legacy_up and st.button("📥 Importar", type="primary", key="cf_legacy_import_btn"):
+            try:
+                result = _cf_import_legacy_excel(legacy_up.read())
+                st.success(
+                    f"✅ Importado: {result['facturas']} facturas, {result['proveedores']} proveedores, "
+                    f"{result['reglas']} reglas especiales, {result['responsables']} responsables nuevos, "
+                    f"{result['estados']} estados nuevos."
+                )
+                for w in result["warnings"]:
+                    st.warning(w)
+                st.info(
+                    "ℹ️ La columna **PAYÉE** del Excel original tenía fórmulas rotas (#REF!) en todas "
+                    "las filas, así que se importó vacía — marcá manualmente las que ya estén pagadas. "
+                    "Revisá también las columnas CC/GL importadas: algunas filas del archivo original "
+                    "estaban incompletas o con datos inconsistentes."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al importar: {e}")
+
