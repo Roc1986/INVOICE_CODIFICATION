@@ -2032,28 +2032,34 @@ def _cf_import_legacy_excel(file_bytes: bytes) -> dict:
                 if etat:
                     seen_estados.add(etat)
                 new_facturas.append({
-                    "id":             _cf_next_id(),
-                    "fournisseur":    str(fournisseur or "").strip(),
-                    "nom_system":     str(gv(row_vals, "NOM SYSTEM") or "").strip(),
-                    "nro_vendor":     str(gv(row_vals, "NRO FOURNISSEUR") or "").strip(),
-                    "nro_facture":    str(nro_facture or "").strip(),
-                    "date_facture":   _cf_fmt_date(gv(row_vals, "DATE FACTURE")),
-                    "division":       str(gv(row_vals, "DIVISION") or "").strip(),
-                    "po_reception":   str(gv(row_vals, "PO - Reception") or "").strip(),
-                    "responsable":    responsable,
-                    "etat":           etat,
-                    "problema":       False,
-                    "comentario":     str(gv(row_vals, "Coment") or "").strip(),
-                    "date_reception": _cf_fmt_date(gv(row_vals, "DATE RECEPTION")),
-                    "poste":          bool(gv(row_vals, "POSTÉ")),
-                    "payee":          False,  # legacy column was #REF! on every row — starts clean
-                    "nom_pdf":        str(gv(row_vals, "NOM PDF") or "").strip(),
-                    "cc":             str(gv(row_vals, "CC") or "").strip(),
-                    "gl":             str(gv(row_vals, "GL") or "").strip(),
-                    "monto":          prix if isinstance(prix, (int, float)) else None,
+                    # A full import REPLACES the list, so the id is just the
+                    # row's position — matching the Excel's own correlativo
+                    # (column A, "=MAX($A12:A$13)+1") instead of an
+                    # ever-growing counter left over from earlier imports.
+                    "id":                  len(new_facturas) + 1,
+                    "fournisseur":         str(fournisseur or "").strip(),
+                    "nom_system":          str(gv(row_vals, "NOM SYSTEM") or "").strip(),
+                    "nro_vendor":          str(gv(row_vals, "NRO FOURNISSEUR") or "").strip(),
+                    "nro_facture":         str(nro_facture or "").strip(),
+                    "date_facture":        _cf_fmt_date(gv(row_vals, "DATE FACTURE")),
+                    "division":            str(gv(row_vals, "DIVISION") or "").strip(),
+                    "po_reception":        str(gv(row_vals, "PO - Reception") or "").strip(),
+                    "responsable":         responsable,
+                    "etat":                etat,
+                    "problema":            False,
+                    "comentario":          str(gv(row_vals, "Coment") or "").strip(),
+                    "date_reception":      _cf_fmt_date(gv(row_vals, "DATE RECEPTION")),
+                    "ultima_actualizacion": _cf_fmt_date(gv(row_vals, "Dernier Misa a jour")),
+                    "poste":               bool(gv(row_vals, "POSTÉ")),
+                    "payee":               False,  # legacy column was #REF! on every row — starts clean
+                    "nom_pdf":             str(gv(row_vals, "NOM PDF") or "").strip(),
+                    "cc":                  str(gv(row_vals, "CC") or "").strip(),
+                    "gl":                  str(gv(row_vals, "GL") or "").strip(),
+                    "monto":               prix if isinstance(prix, (int, float)) else None,
                 })
             if new_facturas:
                 st.session_state.cf_facturas = new_facturas
+                st.session_state.cf_next_id = len(new_facturas) + 1
                 result["facturas"] = len(new_facturas)
             if seen_responsables:
                 existing = set(st.session_state.cf_responsables)
@@ -4139,7 +4145,7 @@ if active_module == "control_prov":
     cf_columns = [
         "id", "fournisseur", "nom_system", "nro_vendor", "nro_facture", "date_facture",
         "division", "po_reception", "responsable", "etat", "problema", "comentario",
-        "date_reception", "poste", "payee", "nom_pdf", "cc", "gl", "monto",
+        "ultima_actualizacion", "date_reception", "poste", "payee", "nom_pdf", "cc", "gl", "monto",
     ]
 
     # ── Recepción ────────────────────────────────────────────────────────────
@@ -4162,6 +4168,60 @@ if active_module == "control_prov":
              | set(f.get("etat", "") for f in st.session_state.cf_facturas))
             - {""}
         )
+
+        with st.expander("➕ Agregar factura nueva", expanded=not st.session_state.cf_facturas):
+            st.caption("Igual que el recuadro de carga del Excel — completá y tocá «Agregar».")
+            with st.form("cf_quick_add_form", clear_on_submit=True):
+                qa1, qa2, qa3 = st.columns(3)
+                with qa1:
+                    qa_prov = st.selectbox("Proveedor", [""] + prov_codes, key="cf_qa_prov")
+                    qa_nro_facture = st.text_input("Nro. Factura", key="cf_qa_nro_facture")
+                    qa_division = st.text_input("División", key="cf_qa_division")
+                with qa2:
+                    qa_date_facture = st.date_input("Fecha factura", value=date.today(), key="cf_qa_date_facture")
+                    qa_po = st.text_input("PO / Recepción", key="cf_qa_po")
+                    qa_monto = st.number_input("Monto + impuestos", min_value=0.0, step=0.01, key="cf_qa_monto")
+                with qa3:
+                    qa_resp = st.selectbox("Responsable", [""] + resp_options, key="cf_qa_resp")
+                    qa_estado = st.selectbox("Estado", [""] + estado_options, key="cf_qa_estado")
+                    qa_nom_pdf = st.text_input("Nombre PDF (opcional)", key="cf_qa_nom_pdf")
+
+                qa_p = _cf_proveedor_lookup(qa_prov) if qa_prov else None
+                if qa_p:
+                    st.caption(f"↳ {qa_p.get('nombre', '')} · # Vendor {qa_p.get('vendor_no', '')}")
+                elif qa_prov:
+                    st.caption("↳ Proveedor no encontrado en la base — completalo en la pestaña Proveedores.")
+
+                if st.form_submit_button("➕ Agregar (Ajouter)", type="primary"):
+                    if not qa_prov or not qa_nro_facture.strip():
+                        st.error("Completá al menos Proveedor y Nro. Factura.")
+                    else:
+                        today_str = date.today().isoformat()
+                        new_row = {
+                            "id":                   _cf_next_id(),
+                            "fournisseur":          qa_prov,
+                            "nom_system":           qa_p.get("nombre", "") if qa_p else "",
+                            "nro_vendor":           qa_p.get("vendor_no", "") if qa_p else "",
+                            "nro_facture":          qa_nro_facture.strip(),
+                            "date_facture":         qa_date_facture.isoformat(),
+                            "division":             qa_division.strip(),
+                            "po_reception":         qa_po.strip(),
+                            "responsable":          qa_resp,
+                            "etat":                 qa_estado,
+                            "problema":             False,
+                            "comentario":           "",
+                            "ultima_actualizacion": today_str,
+                            "date_reception":       today_str,
+                            "poste":                False,
+                            "payee":                False,
+                            "nom_pdf":              qa_nom_pdf.strip(),
+                            "cc":                   "",
+                            "gl":                   "",
+                            "monto":                qa_monto or None,
+                        }
+                        st.session_state.cf_facturas.append(new_row)
+                        st.success(f"✅ Factura #{new_row['id']} agregada — {qa_prov} · {qa_nro_facture.strip()}")
+                        st.rerun()
 
         fcol1, fcol2, fcol3, fcol4 = st.columns(4)
         with fcol1:
@@ -4200,6 +4260,9 @@ if active_module == "control_prov":
                 "etat":           st.column_config.SelectboxColumn("Estado", options=estado_options or [""]),
                 "problema":       st.column_config.CheckboxColumn("¿Problema?"),
                 "comentario":     st.column_config.TextColumn("Comentario"),
+                "ultima_actualizacion": st.column_config.TextColumn(
+                    "Mis à jour", disabled=True, help="Se actualiza sola cuando cambia el Estado"
+                ),
                 "date_reception": st.column_config.TextColumn("Fecha recepción (AAAA-MM-DD)"),
                 "poste":          st.column_config.CheckboxColumn("Posté"),
                 "payee":          st.column_config.CheckboxColumn("Payée"),
@@ -4217,17 +4280,26 @@ if active_module == "control_prov":
         bcol1, bcol2 = st.columns([1, 2])
         with bcol1:
             if st.button("💾 Guardar cambios", type="primary", key="cf_save_facturas"):
+                old_etat_by_id = {r["id"]: r.get("etat", "") for r in st.session_state.cf_facturas}
+                today_str = date.today().isoformat()
                 new_rows = []
                 for r in edited.to_dict("records"):
                     if not str(r.get("fournisseur") or "").strip() and not str(r.get("nro_facture") or "").strip():
                         continue
                     rid = r.get("id")
                     rid = int(rid) if rid is not None and not pd.isna(rid) else _cf_next_id()
+                    new_etat = r.get("etat", "")
+                    # "Mis à jour" tracks changes in Estado — stamp today's
+                    # date whenever it moved (including a brand new row's
+                    # first status), otherwise keep whatever it already had.
+                    ultima = today_str if (rid not in old_etat_by_id or old_etat_by_id[rid] != new_etat) \
+                        else (r.get("ultima_actualizacion") or "")
                     new_rows.append({
                         **r, "id": rid,
                         "poste": bool(r.get("poste")),
                         "payee": bool(r.get("payee")),
                         "problema": bool(r.get("problema")),
+                        "ultima_actualizacion": ultima,
                     })
                 st.session_state.cf_facturas = new_rows
                 st.success(f"✅ {len(new_rows)} facturas guardadas")
@@ -4351,14 +4423,16 @@ if active_module == "control_prov":
         vendor_default = cc_default = gl_default = po_default = ""
         monto_default = ""
         resp_default = current_user
+        sel_key = "manual"
 
         if use_existing:
             options = {
-                f"{f.get('fournisseur','')} · {f.get('nro_facture','')} ({f.get('date_facture','')})": f
-                for f in st.session_state.cf_facturas
+                f"#{f['id']} — {f.get('fournisseur', '')} · {f.get('nro_facture', '')} ({f.get('date_facture', '')})": f
+                for f in sorted(st.session_state.cf_facturas, key=lambda f: f["id"])
             }
-            sel_label = st.selectbox("Factura", list(options.keys()), key="cf_stamp_pick")
+            sel_label = st.selectbox("Factura (por correlativo #)", list(options.keys()), key="cf_stamp_pick")
             picked_factura = options[sel_label]
+            sel_key = picked_factura["id"]
             vendor_default = picked_factura.get("nro_vendor", "")
             cc_default      = picked_factura.get("cc", "")
             gl_default      = picked_factura.get("gl", "")
@@ -4366,17 +4440,21 @@ if active_module == "control_prov":
             monto_default   = picked_factura.get("monto") or ""
             resp_default    = picked_factura.get("responsable") or current_user
 
+        # Keying each field by the selected factura's id (not a fixed key)
+        # forces a fresh widget — with the new defaults — every time the
+        # picked factura changes, instead of Streamlit keeping whatever the
+        # field held for the previously selected one.
         s1, s2, s3 = st.columns(3)
         with s1:
-            stamp_vendor = st.text_input("Vendor", value=str(vendor_default), key="cf_stamp_vendor")
-            stamp_cc = st.text_input("CC", value=str(cc_default), key="cf_stamp_cc")
+            stamp_vendor = st.text_input("Vendor", value=str(vendor_default), key=f"cf_stamp_vendor_{sel_key}")
+            stamp_cc = st.text_input("CC", value=str(cc_default), key=f"cf_stamp_cc_{sel_key}")
         with s2:
-            stamp_gl = st.text_input("GL", value=str(gl_default), key="cf_stamp_gl")
-            stamp_po = st.text_input("PO / Recepción", value=str(po_default), key="cf_stamp_po")
+            stamp_gl = st.text_input("GL", value=str(gl_default), key=f"cf_stamp_gl_{sel_key}")
+            stamp_po = st.text_input("PO / Recepción", value=str(po_default), key=f"cf_stamp_po_{sel_key}")
         with s3:
             stamp_periode = st.text_input("Periodo (MM - AAAA)", value=date.today().strftime("%m - %Y"), key="cf_stamp_periode")
-            stamp_monto = st.text_input("Prix A/T", value=str(monto_default), key="cf_stamp_monto")
-        stamp_posted_by = st.text_input("Posted By", value=str(resp_default), key="cf_stamp_posted_by")
+            stamp_monto = st.text_input("Prix A/T", value=str(monto_default), key=f"cf_stamp_monto_{sel_key}")
+        stamp_posted_by = st.text_input("Posted By", value=str(resp_default), key=f"cf_stamp_posted_by_{sel_key}")
 
         cc_gl = f"{stamp_cc} - {stamp_gl}" if stamp_gl else stamp_cc
         stamp_lines = [
@@ -4432,6 +4510,7 @@ if active_module == "control_prov":
                 }
                 if update_registro and picked_factura is not None:
                     picked_factura["etat"] = "Sellada - enviada a aprobación"
+                    picked_factura["ultima_actualizacion"] = date.today().isoformat()
                     if "Sellada - enviada a aprobación" not in st.session_state.cf_estados:
                         st.session_state.cf_estados.append("Sellada - enviada a aprobación")
                 st.rerun()
@@ -4473,7 +4552,8 @@ if active_module == "control_prov":
         if c_filt_problema:
             rows = [r for r in rows if r.get("problema")]
 
-        ctrl_cols = ["id", "fournisseur", "nro_facture", "date_reception", "responsable", "etat", "problema", "comentario"]
+        ctrl_cols = ["id", "fournisseur", "nro_facture", "date_reception", "responsable",
+                     "etat", "problema", "comentario", "ultima_actualizacion"]
         df_ctrl = pd.DataFrame(rows, columns=ctrl_cols) if rows else pd.DataFrame(columns=ctrl_cols)
 
         edited_ctrl = st.data_editor(
@@ -4487,16 +4567,22 @@ if active_module == "control_prov":
                 "etat":           st.column_config.SelectboxColumn("Estado", options=cestados or [""]),
                 "problema":       st.column_config.CheckboxColumn("¿Problema?"),
                 "comentario":     st.column_config.TextColumn("Comentario"),
+                "ultima_actualizacion": st.column_config.TextColumn(
+                    "Mis à jour", disabled=True, help="Se actualiza sola cuando cambia el Estado"
+                ),
             },
             use_container_width=True, hide_index=True, key="cf_control_editor",
         )
 
         if st.button("💾 Guardar cambios de estado", type="primary", key="cf_save_control"):
             by_id = {r["id"]: r for r in st.session_state.cf_facturas}
+            today_str = date.today().isoformat()
             n = 0
             for r in edited_ctrl.to_dict("records"):
                 rid = r.get("id")
                 if rid in by_id:
+                    if by_id[rid].get("etat", "") != r.get("etat", ""):
+                        by_id[rid]["ultima_actualizacion"] = today_str
                     by_id[rid]["responsable"] = r.get("responsable", "")
                     by_id[rid]["etat"] = r.get("etat", "")
                     by_id[rid]["problema"] = bool(r.get("problema"))
