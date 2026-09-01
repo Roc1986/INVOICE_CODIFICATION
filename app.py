@@ -1952,6 +1952,16 @@ def _cf_next_id() -> int:
     return nid
 
 
+def _cf_periodo_comercial(d: date) -> str:
+    """
+    Format a date as 'MM - AAAA' on the company's commercial calendar,
+    where the year starts in June (junio=01, julio=02, ... mayo=12)
+    instead of the calendar month.
+    """
+    period = ((d.month - 6) % 12) + 1
+    return f"{period:02d} - {d.year}"
+
+
 def _cf_build_nom_pdf(fournisseur, nro_facture, division, po_reception) -> str:
     """
     Auto-generate the invoice's PDF filename from its own fields — nombre
@@ -4461,7 +4471,6 @@ if active_module == "control_prov":
             gl_default      = picked_factura.get("gl", "")
             po_default      = picked_factura.get("po_reception", "")
             monto_default   = picked_factura.get("monto") or ""
-            resp_default    = picked_factura.get("responsable") or current_user
 
         # Keying each field by the selected factura's id (not a fixed key)
         # forces a fresh widget — with the new defaults — every time the
@@ -4475,9 +4484,16 @@ if active_module == "control_prov":
             stamp_gl = st.text_input("GL", value=str(gl_default), key=f"cf_stamp_gl_{sel_key}")
             stamp_po = st.text_input("PO / Recepción", value=str(po_default), key=f"cf_stamp_po_{sel_key}")
         with s3:
-            stamp_periode = st.text_input("Periodo (MM - AAAA)", value=date.today().strftime("%m - %Y"), key="cf_stamp_periode")
+            stamp_periode = st.text_input(
+                "Periodo (MM - AAAA)", value=_cf_periodo_comercial(date.today()), key="cf_stamp_periode",
+                help="Calendario comercial: junio = 01, julio = 02, ... mayo = 12",
+            )
             stamp_monto = st.text_input("Prix A/T", value=str(monto_default), key=f"cf_stamp_monto_{sel_key}")
-        stamp_posted_by = st.text_input("Posted By", value=str(resp_default), key=f"cf_stamp_posted_by_{sel_key}")
+        # Posted By is whoever is registering/sealing this invoice right now
+        # (the sidebar's "Posted By"), not the invoice's own contact person
+        # (that's "responsable", used to request reception) — so it never
+        # depends on which factura is picked.
+        stamp_posted_by = st.text_input("Posted By", value=str(resp_default), key="cf_stamp_posted_by")
 
         cc_gl = f"{stamp_cc} - {stamp_gl}" if stamp_gl else stamp_cc
         stamp_lines = [
