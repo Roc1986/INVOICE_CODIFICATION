@@ -14,6 +14,8 @@ import zipfile
 import re
 import copy
 import json
+import os
+import base64
 import pandas as pd
 from datetime import date, datetime, timedelta
 import openpyxl
@@ -152,6 +154,10 @@ def init_state():
         "cf_stamp_w":               230,
         "cf_stamp_h":               110,
         "cf_stamped_result":        None,
+        "cf_ai_extracted":          None,
+        "cf_ai_pdf_bytes":          None,
+        "cf_ai_pdf_name":           "",
+        "cf_ai_run_id":             0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1971,6 +1977,79 @@ def _cf_build_nom_pdf(fournisseur, nro_facture, division, po_reception) -> str:
     """
     parts = [str(p).strip() for p in (fournisseur, nro_facture, division, po_reception) if str(p or "").strip()]
     return (" ".join(parts) + ".pdf") if parts else ""
+
+
+def _cf_get_anthropic_key():
+    """
+    Read the Anthropic API key from Streamlit secrets (or the environment
+    as a fallback) — returns None if it isn't configured, rather than
+    raising, since st.secrets throws when no secrets.toml exists at all.
+    """
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def _cf_extract_invoice_with_ai(pdf_bytes: bytes, api_key: str, proveedores: list) -> dict:
+    """
+    Ask Claude to read an invoice PDF (rendered as images, since layouts
+    vary too much across vendors for any fixed-position parser) and
+    suggest the fields for the Recepción form. Returns a dict the caller
+    treats as a *suggestion* — the user reviews and corrects it before
+    anything is saved, nothing here writes to cf_facturas directly.
+    """
+    import anthropic
+
+    images = convert_from_bytes(pdf_bytes, first_page=1, last_page=2, dpi=150)
+    content = []
+    for img in images:
+        buf = BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+
+    known = "\n".join(f"- {p['codigo']}: {p['nombre']}" for p in proveedores if p.get("codigo"))
+    prompt = (
+        "Sos un asistente que extrae datos de facturas de proveedores para un sistema "
+        "de control interno de facturas recibidas.\n\n"
+        "Proveedores ya conocidos en la base (código corto: nombre completo):\n"
+        f"{known or '(sin proveedores registrados todavía)'}\n\n"
+        "Mirá la factura en la(s) imagen(es) y devolvé SOLO un JSON (sin texto "
+        "adicional, sin markdown, sin ```), con exactamente esta forma:\n"
+        "{\n"
+        '  "fournisseur_codigo": "código corto de la lista si el proveedor de la '
+        'factura coincide con alguno; si no está en la lista, dejalo vacío",\n'
+        '  "fournisseur_nombre_detectado": "nombre del proveedor tal como aparece '
+        'en la factura",\n'
+        '  "nro_facture": "número de factura",\n'
+        '  "date_facture": "fecha de la factura en formato AAAA-MM-DD, vacío si no '
+        'se ve",\n'
+        '  "division": "código de sucursal/división si aparece en la factura, si '
+        'no vacío",\n'
+        '  "po_reception": "número de orden de compra / PO si aparece, si no '
+        'vacío",\n'
+        '  "monto": total de la factura con impuestos incluidos, como número (sin '
+        "símbolo de moneda), o null si no se puede determinar,\n"
+        '  "nota": "cualquier aclaración breve, por ejemplo si el proveedor no '
+        'está en la lista conocida o algún dato es dudoso"\n'
+        "}"
+    )
+    content.append({"type": "text", "text": prompt})
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-opus-5",
+        max_tokens=1024,
+        output_config={"effort": "low"},
+        messages=[{"role": "user", "content": content}],
+    )
+    raw_text = "".join(b.text for b in response.content if b.type == "text").strip()
+    raw_text = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", raw_text)
+    return json.loads(raw_text)
 
 
 def _cf_proveedor_lookup(codigo: str):
@@ -4154,15 +4233,15 @@ if active_module == "settings":
 if active_module == "control_prov":
     st.caption(
         "Recepción, codificación y control de proveedores **distintos a Atlantic** — "
-        "carga manual de facturas (cada proveedor tiene su propio formato, así que no "
-        "se intenta leer los PDF automáticamente), catálogo de proveedores y "
-        "responsables, sello de codificación con posición ajustable a mano, y "
-        "seguimiento de estado."
+        "carga manual de facturas, con una lectura opcional por IA como ayuda (cada "
+        "proveedor tiene su propio formato, así que siempre revisás y confirmás antes "
+        "de guardar). Catálogo de proveedores y responsables, sello de codificación "
+        "con posición ajustable a mano, y seguimiento de estado."
     )
     cf_tabs = st.tabs([
-        "🧾 Recepción", "🏢 Proveedores", "👥 Responsables", "🏷️ Sello / Timbre",
-        "📋 Control", "📌 Reglas especiales (GL/CC)", "🔄 Cruce con compras (AP)",
-        "📥 Importar tu Excel actual",
+        "🧾 Recepción", "🤖 Leer factura (IA)", "🏢 Proveedores", "👥 Responsables",
+        "🏷️ Sello / Timbre", "📋 Control", "📌 Reglas especiales (GL/CC)",
+        "🔄 Cruce con compras (AP)", "📥 Importar tu Excel actual",
     ])
 
     cf_columns = [
@@ -4308,7 +4387,7 @@ if active_module == "control_prov":
         bcol1, bcol2 = st.columns([1, 2])
         with bcol1:
             if st.button("💾 Guardar cambios", type="primary", key="cf_save_facturas"):
-                old_etat_by_id = {r["id"]: r.get("etat", "") for r in st.session_state.cf_facturas}
+                old_by_id = {r["id"]: r for r in st.session_state.cf_facturas}
                 today_str = date.today().isoformat()
                 new_rows = []
                 for r in edited.to_dict("records"):
@@ -4316,11 +4395,12 @@ if active_module == "control_prov":
                         continue
                     rid = r.get("id")
                     rid = int(rid) if rid is not None and not pd.isna(rid) else _cf_next_id()
+                    old_row = old_by_id.get(rid, {})
                     new_etat = r.get("etat", "")
                     # "Mis à jour" tracks changes in Estado — stamp today's
                     # date whenever it moved (including a brand new row's
                     # first status), otherwise keep whatever it already had.
-                    ultima = today_str if (rid not in old_etat_by_id or old_etat_by_id[rid] != new_etat) \
+                    ultima = today_str if (rid not in old_by_id or old_row.get("etat", "") != new_etat) \
                         else (r.get("ultima_actualizacion") or "")
                     new_rows.append({
                         **r, "id": rid,
@@ -4333,6 +4413,11 @@ if active_module == "control_prov":
                         "nom_pdf": _cf_build_nom_pdf(
                             r.get("fournisseur"), r.get("nro_facture"), r.get("division"), r.get("po_reception")
                         ),
+                        # The grid never shows the attached PDF (it's raw
+                        # base64) — carry it over from the row's prior state
+                        # so saving an edit doesn't silently drop it.
+                        "adjunto_pdf":        old_row.get("adjunto_pdf"),
+                        "adjunto_pdf_nombre": old_row.get("adjunto_pdf_nombre"),
                     })
                 st.session_state.cf_facturas = new_rows
                 st.success(f"✅ {len(new_rows)} facturas guardadas")
@@ -4366,8 +4451,140 @@ if active_module == "control_prov":
         total_monto = sum(r.get("monto") or 0 for r in st.session_state.cf_facturas)
         m5.metric("Monto total", f"${total_monto:,.2f}")
 
-    # ── Proveedores ──────────────────────────────────────────────────────────
+        attached = [r for r in st.session_state.cf_facturas if r.get("adjunto_pdf")]
+        if attached:
+            with st.expander(f"📎 Copias de factura adjuntas ({len(attached)})"):
+                for r in attached:
+                    st.download_button(
+                        f"⬇️ #{r['id']} — {r.get('fournisseur', '')} · {r.get('nro_facture', '')}",
+                        data=base64.b64decode(r["adjunto_pdf"]),
+                        file_name=r.get("adjunto_pdf_nombre") or f"factura_{r['id']}.pdf",
+                        mime="application/pdf",
+                        key=f"cf_download_adjunto_{r['id']}",
+                    )
+
+    # ── Leer factura (IA) ────────────────────────────────────────────────────
     with cf_tabs[1]:
+        st.subheader("Leer factura con IA")
+        st.caption(
+            "Subí el PDF y la IA sugiere los datos para completar el registro — "
+            "vos los revisás y corregís antes de que se guarde nada. Como cada "
+            "proveedor tiene su propio formato, esto no es un lector de reglas "
+            "fijas: lee la factura como lo haría una persona."
+        )
+
+        api_key = _cf_get_anthropic_key()
+        if not api_key:
+            st.warning(
+                "⚠️ Falta configurar la clave de la API de Anthropic para esta función. "
+                "En Streamlit Community Cloud: **Settings → Secrets** y agregá "
+                "`ANTHROPIC_API_KEY = \"sk-ant-...\"` (después reiniciá la app)."
+            )
+
+        ai_pdf_up = st.file_uploader("PDF de la factura", type=["pdf"], key="cf_ai_pdf_uploader")
+
+        if ai_pdf_up and st.button("🤖 Leer con IA", type="primary", key="cf_ai_read_btn", disabled=not api_key):
+            with st.spinner("Leyendo la factura..."):
+                try:
+                    extracted = _cf_extract_invoice_with_ai(
+                        ai_pdf_up.getvalue(), api_key, st.session_state.cf_proveedores
+                    )
+                    st.session_state.cf_ai_extracted = extracted
+                    st.session_state.cf_ai_pdf_bytes = ai_pdf_up.getvalue()
+                    st.session_state.cf_ai_pdf_name = ai_pdf_up.name
+                    st.session_state.cf_ai_run_id += 1
+                except Exception as e:
+                    st.error(f"No se pudo leer la factura: {e}")
+                    st.session_state.cf_ai_extracted = None
+
+        extracted = st.session_state.cf_ai_extracted
+        if extracted:
+            run_id = st.session_state.cf_ai_run_id
+            st.markdown("**Revisá y corregí lo que haga falta antes de agregar:**")
+            if extracted.get("nota"):
+                st.info(f"🤖 {extracted['nota']}")
+            if not extracted.get("fournisseur_codigo") and extracted.get("fournisseur_nombre_detectado"):
+                st.caption(
+                    f"↳ La IA detectó «{extracted['fournisseur_nombre_detectado']}», que no está en "
+                    "tu base de Proveedores — elegí el que corresponda o agregalo antes en esa pestaña."
+                )
+
+            prov_options_ai = [""] + prov_codes
+            default_prov = extracted.get("fournisseur_codigo") or ""
+            prov_index = prov_options_ai.index(default_prov) if default_prov in prov_options_ai else 0
+
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                ai_prov = st.selectbox("Proveedor", prov_options_ai, index=prov_index, key=f"cf_ai_prov_{run_id}")
+                ai_nro_facture = st.text_input(
+                    "Nro. Factura", value=str(extracted.get("nro_facture") or ""), key=f"cf_ai_nro_facture_{run_id}"
+                )
+            with a2:
+                ai_date_facture = st.text_input(
+                    "Fecha factura (AAAA-MM-DD)", value=str(extracted.get("date_facture") or ""),
+                    key=f"cf_ai_date_facture_{run_id}",
+                )
+                ai_division = st.text_input(
+                    "División", value=str(extracted.get("division") or ""), key=f"cf_ai_division_{run_id}"
+                )
+            with a3:
+                ai_po = st.text_input(
+                    "PO / Recepción", value=str(extracted.get("po_reception") or ""), key=f"cf_ai_po_{run_id}"
+                )
+                ai_monto = st.text_input(
+                    "Monto + impuestos", value=str(extracted.get("monto") if extracted.get("monto") is not None else ""),
+                    key=f"cf_ai_monto_{run_id}",
+                )
+            b1, b2 = st.columns(2)
+            with b1:
+                ai_resp = st.selectbox("Responsable", [""] + resp_options, key=f"cf_ai_resp_{run_id}")
+            with b2:
+                ai_estado = st.selectbox("Estado", [""] + estado_options, key=f"cf_ai_estado_{run_id}")
+
+            if st.button("➕ Agregar esta factura", type="primary", key=f"cf_ai_add_{run_id}"):
+                if not ai_prov or not ai_nro_facture.strip():
+                    st.error("Completá al menos Proveedor y Nro. Factura.")
+                else:
+                    ai_p = _cf_proveedor_lookup(ai_prov)
+                    today_str = date.today().isoformat()
+                    ai_division_v = ai_division.strip()
+                    ai_po_v = ai_po.strip()
+                    ai_monto_v = None
+                    try:
+                        ai_monto_v = float(ai_monto) if ai_monto.strip() else None
+                    except ValueError:
+                        pass
+                    new_row = {
+                        "id":                   _cf_next_id(),
+                        "fournisseur":          ai_prov,
+                        "nom_system":           ai_p.get("nombre", "") if ai_p else str(extracted.get("fournisseur_nombre_detectado") or ""),
+                        "nro_vendor":           ai_p.get("vendor_no", "") if ai_p else "",
+                        "nro_facture":          ai_nro_facture.strip(),
+                        "date_facture":         ai_date_facture.strip(),
+                        "division":             ai_division_v,
+                        "po_reception":         ai_po_v,
+                        "responsable":          ai_resp,
+                        "etat":                 ai_estado,
+                        "problema":             False,
+                        "comentario":           "",
+                        "ultima_actualizacion": today_str,
+                        "date_reception":       today_str,
+                        "poste":                False,
+                        "payee":                False,
+                        "nom_pdf":              _cf_build_nom_pdf(ai_prov, ai_nro_facture.strip(), ai_division_v, ai_po_v),
+                        "cc":                   "",
+                        "gl":                   "",
+                        "monto":                ai_monto_v,
+                        "adjunto_pdf":          base64.b64encode(st.session_state.cf_ai_pdf_bytes).decode("ascii"),
+                        "adjunto_pdf_nombre":   st.session_state.cf_ai_pdf_name,
+                    }
+                    st.session_state.cf_facturas.append(new_row)
+                    st.session_state.cf_ai_extracted = None
+                    st.success(f"✅ Factura #{new_row['id']} agregada — {ai_prov} · {ai_nro_facture.strip()}")
+                    st.rerun()
+
+    # ── Proveedores ──────────────────────────────────────────────────────────
+    with cf_tabs[2]:
         st.subheader("Base de proveedores")
         st.caption(
             "Reemplaza la hoja **FOURNISSEUR** del Excel — nombre corto, nombre de "
@@ -4412,7 +4629,7 @@ if active_module == "control_prov":
             st.rerun()
 
     # ── Responsables ─────────────────────────────────────────────────────────
-    with cf_tabs[2]:
+    with cf_tabs[3]:
         st.subheader("Responsables")
         st.caption(
             "Personas que pueden quedar asignadas a una factura en Recepción y Control. "
@@ -4435,7 +4652,7 @@ if active_module == "control_prov":
             st.rerun()
 
     # ── Sello / Timbre ───────────────────────────────────────────────────────
-    with cf_tabs[3]:
+    with cf_tabs[4]:
         st.subheader("Crear y colocar el sello de codificación")
         st.caption(
             "Genera el mismo sello rojo de la hoja CONTROL (Vendor / CC-GL / Periodo / "
@@ -4562,7 +4779,7 @@ if active_module == "control_prov":
             )
 
     # ── Control ──────────────────────────────────────────────────────────────
-    with cf_tabs[4]:
+    with cf_tabs[5]:
         st.subheader("Control y seguimiento de estado")
         st.caption(
             "Validá las facturas recibidas: filtrá y cambiá el estado o marcá si tienen "
@@ -4645,7 +4862,7 @@ if active_module == "control_prov":
                     st.rerun()
 
     # ── Reglas especiales ────────────────────────────────────────────────────
-    with cf_tabs[5]:
+    with cf_tabs[6]:
         st.subheader("Reglas especiales de GL / CC por proveedor")
         st.caption(
             "Generaliza la hoja **Xerox** del Excel a cualquier proveedor que tenga "
@@ -4676,7 +4893,7 @@ if active_module == "control_prov":
             st.rerun()
 
     # ── Cruce con compras (AP) ───────────────────────────────────────────────
-    with cf_tabs[6]:
+    with cf_tabs[7]:
         st.subheader("Cruzar contra el archivo de compras (AP)")
         st.caption(
             "Reemplaza el link externo del Excel a `Fichier des achats - AP.xlsx` (105k filas). "
@@ -4716,7 +4933,7 @@ if active_module == "control_prov":
                 del ap_bytes
 
     # ── Importar tu Excel actual ─────────────────────────────────────────────
-    with cf_tabs[7]:
+    with cf_tabs[8]:
         st.subheader("Importar desde tu Excel actual (CONTROL_FACTURES)")
         st.caption(
             "Migra el contenido de tu archivo .xlsm/.xlsx actual (hojas CONTROL, FOURNISSEUR "
