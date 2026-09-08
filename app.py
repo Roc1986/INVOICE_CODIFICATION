@@ -701,6 +701,12 @@ def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
 
 def run_matching(invoice_files: list, po_files: list,
                  progress_callback=None) -> dict:
+    """
+    Streams matched/pending PDFs straight into the result ZIP instead of
+    holding a second copy of every merged PDF in a Python list — a batch of
+    real scanned invoices can otherwise double its peak memory footprint,
+    which is enough to hit Render/Streamlit free-tier RAM limits.
+    """
     po_lookup = {}
     for f in po_files:
         key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
@@ -711,66 +717,59 @@ def run_matching(invoice_files: list, po_files: list,
     pending = []
     total = len(invoice_files)
 
-    for i, inv_file in enumerate(invoice_files):
-        inv_bytes = inv_file.read()
-        fname = inv_file.name
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, inv_file in enumerate(invoice_files):
+            inv_bytes = inv_file.read()
+            fname = inv_file.name
 
-        if progress_callback:
-            progress_callback(i, total, fname)
+            if progress_callback:
+                progress_callback(i, total, fname)
 
-        po_id = extract_po_from_invoice_name(fname)
+            po_id = extract_po_from_invoice_name(fname)
 
-        if po_id is None:
-            pending.append({
-                "invoice_name": fname,
-                "po_id":        "—",
-                "reason":       "Invalid filename format (needs at least 3 space-separated parts)",
-                "inv_bytes":    inv_bytes,
-            })
-            continue
+            if po_id is None:
+                zf.writestr(f"pending/{fname}", inv_bytes)
+                pending.append({
+                    "invoice_name": fname,
+                    "po_id":        "—",
+                    "reason":       "Invalid filename format (needs at least 3 space-separated parts)",
+                })
+                continue
 
-        po_key = po_id.upper()
-        if po_key in po_lookup:
-            po_bytes = po_lookup[po_key]
-            used_po_keys.add(po_key)
-            flat_inv = flatten_pdf(inv_bytes)
-            flat_po  = flatten_pdf(po_bytes)
-            merged   = merge_two_pdfs(flat_inv, flat_po)
-            matched.append({
-                "invoice_name": fname,
-                "po_name":      f"{po_id}.pdf",
-                "po_id":        po_id,
-                "merged_bytes": merged,
-            })
-        else:
-            pending.append({
-                "invoice_name": fname,
-                "po_id":        po_id,
-                "reason":       f"No PO file found for '{po_id}'",
-                "inv_bytes":    inv_bytes,
-            })
+            po_key = po_id.upper()
+            if po_key in po_lookup:
+                po_bytes = po_lookup[po_key]
+                used_po_keys.add(po_key)
+                flat_inv = flatten_pdf(inv_bytes)
+                flat_po  = flatten_pdf(po_bytes)
+                merged   = merge_two_pdfs(flat_inv, flat_po)
+                zf.writestr(f"matched/{fname}", merged)
+                matched.append({
+                    "invoice_name": fname,
+                    "po_name":      f"{po_id}.pdf",
+                    "po_id":        po_id,
+                })
+            else:
+                zf.writestr(f"pending/{fname}", inv_bytes)
+                pending.append({
+                    "invoice_name": fname,
+                    "po_id":        po_id,
+                    "reason":       f"No PO file found for '{po_id}'",
+                })
 
     unmatched_po = [
         name for name in po_lookup
         if name not in used_po_keys
     ]
 
+    zip_buf.seek(0)
     return {
         "matched":       matched,
         "pending":       pending,
         "unmatched_po":  unmatched_po,
+        "zip_bytes":     zip_buf.read(),
     }
-
-
-def make_matcher_zip(results: dict) -> bytes:
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in results["matched"]:
-            zf.writestr(f"matched/{item['invoice_name']}", item["merged_bytes"])
-        for item in results["pending"]:
-            zf.writestr(f"pending/{item['invoice_name']}", item["inv_bytes"])
-    buf.seek(0)
-    return buf.read()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2784,7 +2783,7 @@ if active_module == "matcher":
         prog_text.empty()
 
         st.session_state.matcher_results = results
-        st.session_state.matcher_zip     = make_matcher_zip(results)
+        st.session_state.matcher_zip     = results["zip_bytes"]
         st.rerun()
 
     # ── Results ────────────────────────────────────────────────────────────────
@@ -2830,26 +2829,27 @@ if active_module == "matcher":
 
         if matched:
             with st.expander(f"✅ Matched ({len(matched)})", expanded=True):
-                for item in matched:
-                    col1, col2 = st.columns([5, 1])
-                    with col1:
-                        st.markdown(
-                            f"<div class='match-row'>"
-                            f"✅ <b>{item['invoice_name']}</b>"
-                            f"&nbsp;&nbsp;+&nbsp;&nbsp;"
-                            f"📦 <code>{item['po_name']}</code>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with col2:
-                        st.download_button(
-                            "⬇️",
-                            data=item["merged_bytes"],
-                            file_name=item["invoice_name"],
-                            mime="application/pdf",
-                            key=f"mdl_{item['invoice_name']}",
-                            use_container_width=True,
-                        )
+                with zipfile.ZipFile(BytesIO(st.session_state.matcher_zip)) as zf:
+                    for item in matched:
+                        col1, col2 = st.columns([5, 1])
+                        with col1:
+                            st.markdown(
+                                f"<div class='match-row'>"
+                                f"✅ <b>{item['invoice_name']}</b>"
+                                f"&nbsp;&nbsp;+&nbsp;&nbsp;"
+                                f"📦 <code>{item['po_name']}</code>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with col2:
+                            st.download_button(
+                                "⬇️",
+                                data=zf.read(f"matched/{item['invoice_name']}"),
+                                file_name=item["invoice_name"],
+                                mime="application/pdf",
+                                key=f"mdl_{item['invoice_name']}",
+                                use_container_width=True,
+                            )
 
         if pending:
             with st.expander(f"⚠️ Unmatched Invoices ({len(pending)})", expanded=True):
