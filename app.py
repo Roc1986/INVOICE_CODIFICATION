@@ -706,11 +706,16 @@ def run_matching(invoice_files: list, po_files: list,
     holding a second copy of every merged PDF in a Python list — a batch of
     real scanned invoices can otherwise double its peak memory footprint,
     which is enough to hit Render/Streamlit free-tier RAM limits.
+
+    PO bytes are read lazily, only for POs an invoice actually matches —
+    eagerly reading every uploaded PO up front duplicated their bytes a
+    second time (on top of what Streamlit already buffers per upload) even
+    for POs that end up unused.
     """
     po_lookup = {}
     for f in po_files:
         key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
-        po_lookup[key] = f.read()
+        po_lookup[key] = f
 
     used_po_keys = set()
     matched = []
@@ -739,7 +744,7 @@ def run_matching(invoice_files: list, po_files: list,
 
             po_key = po_id.upper()
             if po_key in po_lookup:
-                po_bytes = po_lookup[po_key]
+                po_bytes = po_lookup[po_key].getvalue()
                 used_po_keys.add(po_key)
                 flat_inv = flatten_pdf(inv_bytes)
                 flat_po  = flatten_pdf(po_bytes)
