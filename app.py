@@ -2429,6 +2429,16 @@ def _fmt_jaccard(a: frozenset, b: frozenset) -> float:
     return len(a & b) / union if union else 0.0
 
 
+# Control characters (other than tab/newline/CR) that openpyxl refuses to
+# write to an .xlsx cell — OCR'd or oddly-encoded invoice text can carry
+# these, which otherwise crashes report generation with IllegalCharacterError.
+_FMT_ILLEGAL_XLSX_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+
+
+def _fmt_xlsx_safe(text) -> str:
+    return _FMT_ILLEGAL_XLSX_RE.sub("", str(text or ""))
+
+
 def _fmt_text_preview(pdf_bytes: bytes, max_chars: int = 140) -> str:
     """Short first-page text snippet, captured once per group (from the
     first invoice that started it) so a format can be identified from the
@@ -2438,7 +2448,7 @@ def _fmt_text_preview(pdf_bytes: bytes, max_chars: int = 140) -> str:
             if pdf.pages:
                 text = pdf.pages[0].extract_text() or ""
                 snippet = " ".join(text.split())
-                return snippet[:max_chars]
+                return _fmt_xlsx_safe(snippet[:max_chars])
     except Exception:
         pass
     return ""
@@ -2455,15 +2465,15 @@ def _fmt_build_report_excel(groups: list) -> bytes:
     resumen_df = pd.DataFrame([
         {
             "ID":                         g["id"],
-            "Formato":                    g["label"],
+            "Formato":                    _fmt_xlsx_safe(g["label"]),
             "Cantidad":                   len(g["files"]),
             "% del total":                round(100 * len(g["files"]) / total, 1),
-            "Vista previa (1ra factura)": g.get("preview", ""),
+            "Vista previa (1ra factura)": _fmt_xlsx_safe(g.get("preview", "")),
         }
         for g in groups
     ])
     detalle_df = pd.DataFrame([
-        {"ID": g["id"], "Formato": g["label"], "Archivo": f["filename"]}
+        {"ID": g["id"], "Formato": _fmt_xlsx_safe(g["label"]), "Archivo": _fmt_xlsx_safe(f["filename"])}
         for g in groups for f in g["files"]
     ])
     buf = BytesIO()
