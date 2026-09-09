@@ -2429,6 +2429,51 @@ def _fmt_jaccard(a: frozenset, b: frozenset) -> float:
     return len(a & b) / union if union else 0.0
 
 
+def _fmt_text_preview(pdf_bytes: bytes, max_chars: int = 140) -> str:
+    """Short first-page text snippet, captured once per group (from the
+    first invoice that started it) so a format can be identified from the
+    report table without opening any sample PDF."""
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if pdf.pages:
+                text = pdf.pages[0].extract_text() or ""
+                snippet = " ".join(text.split())
+                return snippet[:max_chars]
+    except Exception:
+        pass
+    return ""
+
+
+def _fmt_build_report_excel(groups: list) -> bytes:
+    """
+    Two-sheet Excel report — Resumen (one row per format, with count and a
+    text preview) and Detalle (one row per file) — so every detected
+    format can be reviewed and cross-checked without opening the app's
+    per-group view one by one.
+    """
+    total = sum(len(g["files"]) for g in groups) or 1
+    resumen_df = pd.DataFrame([
+        {
+            "ID":                         g["id"],
+            "Formato":                    g["label"],
+            "Cantidad":                   len(g["files"]),
+            "% del total":                round(100 * len(g["files"]) / total, 1),
+            "Vista previa (1ra factura)": g.get("preview", ""),
+        }
+        for g in groups
+    ])
+    detalle_df = pd.DataFrame([
+        {"ID": g["id"], "Formato": g["label"], "Archivo": f["filename"]}
+        for g in groups for f in g["files"]
+    ])
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        resumen_df.to_excel(writer, sheet_name="Resumen", index=False)
+        detalle_df.to_excel(writer, sheet_name="Detalle", index=False)
+    buf.seek(0)
+    return buf.read()
+
+
 def _fmt_build_sample_zip(groups: list, samples_per_group: int) -> bytes:
     """Package N sample PDFs per detected format, plus a manifest listing
     every file in every group, into one ZIP ready to hand off."""
@@ -5137,6 +5182,7 @@ if active_module == "format_grouper":
                             "id":        len(groups) + 1,
                             "label":     f"Formato {len(groups) + 1}",
                             "signature": sig,
+                            "preview":   _fmt_text_preview(fbytes),
                             "files":     [{"filename": fname, "pdf_bytes": fbytes}],
                         })
                 progress.empty()
@@ -5164,16 +5210,46 @@ if active_module == "format_grouper":
         else:
             total = sum(len(g["files"]) for g in fmt_groups)
             st.markdown(f"**{len(fmt_groups)} formato(s)** detectados sobre **{total} factura(s)**.")
+            st.caption(
+                "Reporte de formatos — editá el nombre directamente en la tabla si querés "
+                "identificarlos (ej. el proveedor). No hace falta abrir cada grupo."
+            )
 
-            summary_rows = [
+            summary_df = pd.DataFrame([
                 {
-                    "Formato":     g["label"],
-                    "Cantidad":    len(g["files"]),
-                    "% del total": round(100 * len(g["files"]) / total, 1) if total else 0,
+                    "ID":                         g["id"],
+                    "Formato":                    g["label"],
+                    "Cantidad":                   len(g["files"]),
+                    "% del total":                round(100 * len(g["files"]) / total, 1) if total else 0,
+                    "Vista previa (1ra factura)": g.get("preview") or "(sin texto extraído)",
                 }
                 for g in fmt_groups
-            ]
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            ])
+            edited_df = st.data_editor(
+                summary_df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["ID", "Cantidad", "% del total", "Vista previa (1ra factura)"],
+                key="fmt_summary_editor",
+            )
+            label_by_id = dict(zip(edited_df["ID"], edited_df["Formato"]))
+            for g in fmt_groups:
+                g["label"] = label_by_id.get(g["id"], g["label"])
+
+            st.download_button(
+                "📄 Descargar reporte (Excel)",
+                data=_fmt_build_report_excel(fmt_groups),
+                file_name=f"reporte_formatos_facturas_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            with st.expander("📋 Ver el detalle completo: cada archivo con su formato"):
+                detail_df = pd.DataFrame([
+                    {"ID": g["id"], "Formato": g["label"], "Archivo": f["filename"]}
+                    for g in fmt_groups for f in g["files"]
+                ])
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
             fmt_samples_n = st.number_input(
                 "Muestras por formato a incluir en el ZIP de entrega",
@@ -5181,18 +5257,6 @@ if active_module == "format_grouper":
                 value=st.session_state.fmt_samples_per_group, step=1,
             )
             st.session_state.fmt_samples_per_group = fmt_samples_n
-
-            for g in fmt_groups:
-                with st.expander(f"🗂️ {g['label']} — {len(g['files'])} factura(s)"):
-                    g["label"] = st.text_input(
-                        "Nombre del formato", value=g["label"], key=f"fmt_label_{g['id']}",
-                    )
-                    filenames = [f["filename"] for f in g["files"]]
-                    shown = ", ".join(filenames[:50])
-                    if len(filenames) > 50:
-                        shown += f" … (+{len(filenames) - 50} más)"
-                    st.caption("Archivos en este grupo:")
-                    st.write(shown)
 
             if st.button("📦 Generar ZIP de muestras para entregar", type="primary"):
                 st.session_state.fmt_zip = _fmt_build_sample_zip(fmt_groups, int(fmt_samples_n))
