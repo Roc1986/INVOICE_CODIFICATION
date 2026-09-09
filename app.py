@@ -158,6 +158,15 @@ def init_state():
         "cf_ai_pdf_bytes":          None,
         "cf_ai_pdf_name":           "",
         "cf_ai_run_id":             0,
+        # Format Grouper (temporary module) — clusters a bulk upload of
+        # invoices by visual layout so a handful of representative samples
+        # per format can be handed off (e.g. to a team building a generic
+        # invoice reader for many vendors).
+        "fmt_upload_key":           0,
+        "fmt_groups":               [],   # [{"id","label","signature","files":[{"filename","pdf_bytes"}]}]
+        "fmt_threshold":            0.55,
+        "fmt_samples_per_group":    3,
+        "fmt_zip":                  None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2360,6 +2369,93 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── FORMAT GROUPER FUNCTIONS (temporary module) ──────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_page_words(pdf_bytes: bytes) -> tuple:
+    """
+    Words + page size for the first page. Falls back to OCR bounding boxes
+    (via pytesseract's word-level data) when the PDF has no usable text
+    layer, so scanned invoices can still be grouped by layout.
+    """
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if pdf.pages:
+                page = pdf.pages[0]
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
+                if sum(len(w["text"]) for w in words) >= 20:
+                    return words, float(page.width), float(page.height)
+    except Exception:
+        pass
+
+    if OCR_AVAILABLE:
+        try:
+            img = _splitter_render_page_image(pdf_bytes, 1, dpi=150)
+            if img is not None:
+                data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+                words = [
+                    {"text": t, "x0": data["left"][i], "top": data["top"][i]}
+                    for i, t in enumerate(data["text"]) if t.strip()
+                ]
+                return words, float(img.width), float(img.height)
+        except Exception:
+            pass
+    return [], 0.0, 0.0
+
+
+def _fmt_signature_for_pdf(pdf_bytes: bytes, grid: int = 24) -> frozenset:
+    """
+    Layout fingerprint: which cells of a grid-x-grid overlay on the first
+    page contain text. Invoices sharing a template put their labels and
+    table headers in the same cells even though the variable data (dates,
+    amounts, invoice numbers) differs — so this groups by visual format
+    rather than by content.
+    """
+    words, page_w, page_h = _fmt_page_words(pdf_bytes)
+    if not words or not page_w or not page_h:
+        return frozenset()
+    cells = set()
+    for w in words:
+        col = min(grid - 1, max(0, int(grid * w["x0"] / page_w)))
+        row = min(grid - 1, max(0, int(grid * w["top"] / page_h)))
+        cells.add((col, row))
+    return frozenset(cells)
+
+
+def _fmt_jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+def _fmt_build_sample_zip(groups: list, samples_per_group: int) -> bytes:
+    """Package N sample PDFs per detected format, plus a manifest listing
+    every file in every group, into one ZIP ready to hand off."""
+    buf = BytesIO()
+    manifest_rows = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for g in groups:
+            safe_label = re.sub(r'[\\/*?:"<>|]', "_", g["label"]).strip() or f"formato_{g['id']}"
+            folder = f"{g['id']:02d}_{safe_label}"
+            for idx, f in enumerate(g["files"]):
+                included = idx < samples_per_group
+                if included:
+                    zf.writestr(f"{folder}/{f['filename']}", f["pdf_bytes"])
+                manifest_rows.append({
+                    "formato_id":            g["id"],
+                    "formato":               g["label"],
+                    "archivo":               f["filename"],
+                    "incluido_como_muestra": included,
+                })
+        csv_buf = BytesIO()
+        pd.DataFrame(manifest_rows).to_csv(csv_buf, index=False)
+        zf.writestr("manifest.csv", csv_buf.getvalue())
+    buf.seek(0)
+    return buf.read()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE REGISTRY
 # ─────────────────────────────────────────────────────────────────────────────
 MODULES = [
@@ -2374,6 +2470,8 @@ MODULES = [
     {"key": "settings", "icon": "⚙️",  "label": "Settings",          "desc": "Configure the coding stamp position."},
     {"key": "control_prov", "icon": "📋", "label": "Control Facturas — Otros Proveedores",
      "desc": "Recepción, codificación y control de proveedores distintos a Atlantic."},
+    {"key": "format_grouper", "icon": "🧩", "label": "Agrupador de Formatos (temporal)",
+     "desc": "Agrupa un volumen grande de facturas por formato/diseño y arma muestras para entregar."},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4966,4 +5064,145 @@ if active_module == "control_prov":
                 st.rerun()
             except Exception as e:
                 st.error(f"Error al importar: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — AGRUPADOR DE FORMATOS (módulo temporal)
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "format_grouper":
+    st.caption(
+        "Módulo temporal: agrupa un volumen grande de facturas por **formato/diseño** "
+        "(no por proveedor puntual) comparando dónde cae el texto en la página. "
+        "Sirve para armar un lote de muestras representativas de cada formato — por "
+        "ejemplo, para entregárselo a un equipo que está construyendo un lector de "
+        "facturas por IA para varios proveedores."
+    )
+
+    up_tab, groups_tab = st.tabs(["📤 Cargar facturas", "🗂️ Grupos y muestras"])
+
+    with up_tab:
+        st.markdown(
+            "Subí las facturas en PDF (podés seleccionar muchas a la vez) o uno o más "
+            "archivos **.zip** con las facturas adentro — útil para cargar un volumen grande "
+            "sin tener que seleccionar archivo por archivo."
+        )
+        fmt_files = st.file_uploader(
+            "Facturas (PDF o ZIP)",
+            type=["pdf", "zip"],
+            accept_multiple_files=True,
+            key=f"fmt_uploader_{st.session_state.fmt_upload_key}",
+        )
+        fmt_threshold = st.slider(
+            "Sensibilidad de agrupación",
+            min_value=0.30, max_value=0.90,
+            value=st.session_state.fmt_threshold, step=0.05,
+            help="Más alto = más estricto (separa en más grupos). Más bajo = agrupa "
+                 "formatos parecidos entre sí con más facilidad.",
+        )
+        st.session_state.fmt_threshold = fmt_threshold
+
+        if fmt_files and st.button("🔎 Analizar y agrupar", type="primary"):
+            pending = []
+            for f in fmt_files:
+                if f.name.lower().endswith(".zip"):
+                    try:
+                        with zipfile.ZipFile(BytesIO(f.read())) as zf:
+                            for name in zf.namelist():
+                                if name.lower().endswith(".pdf") and not name.endswith("/"):
+                                    pending.append((os.path.basename(name), zf.read(name)))
+                    except Exception as e:
+                        st.error(f"No se pudo leer el ZIP '{f.name}': {e}")
+                else:
+                    pending.append((f.name, f.read()))
+
+            if not pending:
+                st.warning("No se encontraron PDFs para analizar.")
+            else:
+                groups = []
+                progress = st.progress(0.0, text="Analizando facturas...")
+                for i, (fname, fbytes) in enumerate(pending):
+                    progress.progress(
+                        (i + 1) / len(pending),
+                        text=f"Analizando {fname} ({i + 1}/{len(pending)})",
+                    )
+                    sig = _fmt_signature_for_pdf(fbytes)
+                    best_group, best_score = None, 0.0
+                    for g in groups:
+                        score = _fmt_jaccard(sig, g["signature"])
+                        if score > best_score:
+                            best_group, best_score = g, score
+                    if best_group is not None and best_score >= fmt_threshold:
+                        best_group["files"].append({"filename": fname, "pdf_bytes": fbytes})
+                    else:
+                        groups.append({
+                            "id":        len(groups) + 1,
+                            "label":     f"Formato {len(groups) + 1}",
+                            "signature": sig,
+                            "files":     [{"filename": fname, "pdf_bytes": fbytes}],
+                        })
+                progress.empty()
+
+                groups.sort(key=lambda g: len(g["files"]), reverse=True)
+                for idx, g in enumerate(groups, start=1):
+                    if g["label"] == f"Formato {g['id']}":
+                        g["label"] = f"Formato {idx}"
+                    g["id"] = idx
+
+                st.session_state.fmt_groups = groups
+                st.session_state.fmt_zip = None
+                st.success(f"✅ {len(pending)} factura(s) agrupada(s) en {len(groups)} formato(s).")
+
+        if st.session_state.fmt_groups and st.button("🗑️ Borrar resultados y empezar de nuevo"):
+            st.session_state.fmt_groups = []
+            st.session_state.fmt_zip = None
+            st.session_state.fmt_upload_key += 1
+            st.rerun()
+
+    with groups_tab:
+        fmt_groups = st.session_state.fmt_groups
+        if not fmt_groups:
+            st.info("Todavía no analizaste ninguna factura. Subí archivos en la pestaña anterior.")
+        else:
+            total = sum(len(g["files"]) for g in fmt_groups)
+            st.markdown(f"**{len(fmt_groups)} formato(s)** detectados sobre **{total} factura(s)**.")
+
+            summary_rows = [
+                {
+                    "Formato":     g["label"],
+                    "Cantidad":    len(g["files"]),
+                    "% del total": round(100 * len(g["files"]) / total, 1) if total else 0,
+                }
+                for g in fmt_groups
+            ]
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+            fmt_samples_n = st.number_input(
+                "Muestras por formato a incluir en el ZIP de entrega",
+                min_value=1, max_value=20,
+                value=st.session_state.fmt_samples_per_group, step=1,
+            )
+            st.session_state.fmt_samples_per_group = fmt_samples_n
+
+            for g in fmt_groups:
+                with st.expander(f"🗂️ {g['label']} — {len(g['files'])} factura(s)"):
+                    g["label"] = st.text_input(
+                        "Nombre del formato", value=g["label"], key=f"fmt_label_{g['id']}",
+                    )
+                    filenames = [f["filename"] for f in g["files"]]
+                    shown = ", ".join(filenames[:50])
+                    if len(filenames) > 50:
+                        shown += f" … (+{len(filenames) - 50} más)"
+                    st.caption("Archivos en este grupo:")
+                    st.write(shown)
+
+            if st.button("📦 Generar ZIP de muestras para entregar", type="primary"):
+                st.session_state.fmt_zip = _fmt_build_sample_zip(fmt_groups, int(fmt_samples_n))
+
+            if st.session_state.fmt_zip:
+                st.download_button(
+                    "⬇️ Descargar ZIP de muestras",
+                    data=st.session_state.fmt_zip,
+                    file_name=f"muestras_formatos_facturas_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
 
