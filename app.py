@@ -114,6 +114,11 @@ def init_state():
         "splitter_zip":        None,
         "splitter_upload_key": 0,
         "splitter_rotation":   0,    # rotation applied to scanned (OCR) batches
+        # Bourret splitter state
+        "bourret_results":     [],   # [{"filename", "pdf_bytes", "invoice_no", "pod_no", "pages", "warning", "ocr_used"}]
+        "bourret_zip":         None,
+        "bourret_upload_key":  0,
+        "bourret_rotation":    0,
         # AP Audit state
         "audit_results":       None,
         "audit_data_count":    0,
@@ -392,6 +397,165 @@ def split_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callback=None)
 
 
 def make_splitter_zip(results: list) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in results:
+            zf.writestr(item["filename"], item["pdf_bytes"])
+    buf.seek(0)
+    return buf.read()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── BOURRET SPLITTER FUNCTIONS ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bourret_extract_ids(lines: list) -> tuple:
+    """
+    pdfplumber reads the Bourret voucher's two-column header top-to-bottom,
+    which interleaves it with the invoice/POD numbers like this:
+        14641637              <- Invoice No. (line right BEFORE the marker)
+        TRANSPORT BOURRET INC.
+        24-08-2026
+        24-08-2026
+        JJ-MM-AAAA
+        DD-MM-YYYY
+        59061392              <- POD No. (first all-digit line AFTER the marker)
+        6183                  <- carrier reference code (ignored)
+    The marker also reappears later near the remittance address, where the
+    preceding line isn't a bare number — so only the first occurrence with
+    a valid invoice number actually matches.
+    Returns (invoice_no, pod_no) — either may be None if not found.
+    """
+    for i, line in enumerate(lines):
+        if "TRANSPORT BOURRET" in line.upper():
+            invoice_no = None
+            if i > 0 and re.fullmatch(r"\d{6,10}", lines[i - 1].strip()):
+                invoice_no = lines[i - 1].strip()
+            if not invoice_no:
+                continue
+            pod_no = None
+            for ln in lines[i + 1:i + 8]:
+                if re.fullmatch(r"\d{6,10}", ln.strip()):
+                    pod_no = ln.strip()
+                    break
+            return invoice_no, pod_no
+    return None, None
+
+
+def _bourret_suggest_rotation(pdf_bytes: bytes, sample_pages: int = 3) -> int:
+    """Same idea as _splitter_suggest_rotation, scored against the Bourret
+    invoice/POD pattern instead of the Atlantic one."""
+    reader = PdfReader(BytesIO(pdf_bytes))
+    n = min(sample_pages, len(reader.pages))
+    if n == 0:
+        return 0
+
+    scores = {90: 0.0, 270: 0.0, 0: 0.0, 180: 0.0}
+    for page_no in range(1, n + 1):
+        img = _splitter_render_page_image(pdf_bytes, page_no, dpi=150)
+        if img is None:
+            continue
+        for angle in scores:
+            rimg = img.rotate(angle, expand=True) if angle else img
+            try:
+                text = pytesseract.image_to_string(rimg)
+            except Exception:
+                text = ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            invoice_no, pod_no = _bourret_extract_ids(lines)
+            if invoice_no and pod_no:
+                scores[angle] += 20
+            if "TRANSPORT BOURRET" in text.upper():
+                scores[angle] += 3
+    return max(scores, key=scores.get)
+
+
+def split_bourret_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callback=None) -> list:
+    """
+    Split a Transport Bourret AP voucher batch into individual invoices.
+
+    Each invoice starts on a page carrying 'TRANSPORT BOURRET INC.' (the
+    invoice page) and is followed by its backup page(s) — proof of
+    delivery / scanned bill of lading — up to the next invoice marker.
+    Handles both regular (text-layer) batches and scanned batches, which
+    fall back to OCR automatically. `rotation` (0/90/180/270) corrects
+    pages that came out of the scanner sideways.
+
+    Returns list of dicts:
+      { filename, pdf_bytes, invoice_no, pod_no, source_pages, page_count,
+        warning, ocr_used }
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        page_texts = [p.extract_text() or "" for p in pdf.pages]
+
+    total_pages = len(page_texts)
+    needs_ocr = OCR_AVAILABLE and len("".join(page_texts[:3]).strip()) < 30
+
+    if needs_ocr:
+        page_texts = []
+        for page_idx in range(total_pages):
+            if progress_callback:
+                progress_callback(page_idx + 1, total_pages)
+            img = _splitter_render_page_image(pdf_bytes, page_idx + 1, dpi=200)
+            if img is not None and rotation:
+                img = img.rotate(rotation, expand=True)
+            page_texts.append(pytesseract.image_to_string(img) if img is not None else "")
+
+    invoices = []   # accumulated invoice dicts
+    current  = None  # {"invoice_no", "pod_no", "pages": [0-based idx]}
+
+    for page_idx, text in enumerate(page_texts):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        invoice_no, pod_no = _bourret_extract_ids(lines)
+
+        if invoice_no:
+            if current is not None:
+                invoices.append(current)
+            current = {"invoice_no": invoice_no, "pod_no": pod_no, "pages": [page_idx]}
+        elif current is not None:
+            current["pages"].append(page_idx)
+
+    if current is not None:
+        invoices.append(current)
+
+    results = []
+    for inv in invoices:
+        writer = PdfWriter()
+        for p in inv["pages"]:
+            page = reader.pages[p]
+            if needs_ocr and rotation:
+                # Same convention as the Atlantic splitter: PIL rotates
+                # counter-clockwise, pypdf's Page.rotate() clockwise.
+                page.rotate((-rotation) % 360)
+            writer.add_page(page)
+        buf = BytesIO()
+        writer.write(buf)
+
+        invoice_no = inv["invoice_no"]
+        pod_no     = inv["pod_no"] or "??"
+        warn = None
+        if inv["pod_no"] is None:
+            warn = "⚠️ POD number not detected — set to '??'"
+        if needs_ocr:
+            warn = (warn or "") + "  📷 Read via OCR — please double-check the fields"
+
+        results.append({
+            "filename":     f"{invoice_no} EV {pod_no}.pdf",
+            "pdf_bytes":    buf.getvalue(),
+            "invoice_no":   invoice_no,
+            "pod_no":       pod_no,
+            "source_pages": [p + 1 for p in inv["pages"]],
+            "page_count":   len(inv["pages"]),
+            "warning":      warn,
+            "ocr_used":     needs_ocr,
+        })
+
+    return results
+
+
+def make_bourret_zip(results: list) -> bytes:
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in results:
@@ -1984,6 +2148,7 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 MODULES = [
     {"key": "splitter", "icon": "✂️",  "label": "Invoice Splitter",  "desc": "Split batch PDFs into individual invoice files."},
+    {"key": "bourret",  "icon": "🚛", "label": "Bourret Splitter",  "desc": "Split Transport Bourret AP batches by Invoice + POD."},
     {"key": "matcher",  "icon": "🔗", "label": "Invoice Matcher",   "desc": "Match invoices with POs and merge into one PDF."},
     {"key": "coding",   "icon": "🏷️",  "label": "Invoice Coding",    "desc": "Stamp GL / Cost Centre codes on invoices."},
     {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
@@ -2312,6 +2477,199 @@ if active_module == "splitter":
 
     elif not split_uploads:
         st.info("📂 Upload one or more Atlantic batch PDFs to get started.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1B — BOURRET SPLITTER
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "bourret":
+    st.subheader("🚛 Split Transport Bourret AP Batches")
+    st.markdown(
+        "Upload one or more **Transport Bourret voucher batch PDFs** (each invoice is "
+        "2 pages — the invoice itself, then its backup/POD page). The tool detects each "
+        "invoice automatically and names each file as **`{Invoice No} EV {POD No}.pdf`**."
+    )
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        bourret_uploads = st.file_uploader(
+            "Drag or select one or more Bourret batch PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"bourret_uploader_{st.session_state.bourret_upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="bourret_clear"):
+            st.session_state.bourret_results   = []
+            st.session_state.bourret_zip       = None
+            st.session_state.bourret_upload_key += 1
+            st.rerun()
+
+    if bourret_uploads:
+        upload_sig = tuple((f.name, f.size) for f in bourret_uploads)
+        if st.session_state.get("_bourret_preview_sig") != upload_sig:
+            st.session_state["_bourret_preview_sig"] = upload_sig
+            scanned_bytes = None
+            for f in bourret_uploads:
+                fb = f.getvalue()
+                with pdfplumber.open(BytesIO(fb)) as pdf:
+                    sample_text = "".join((p.extract_text() or "") for p in pdf.pages[:3])
+                if len(sample_text.strip()) < 30:
+                    scanned_bytes = fb
+                    break
+            st.session_state["_bourret_scanned_sample"] = scanned_bytes
+            st.session_state["bourret_rotation"] = (
+                _bourret_suggest_rotation(scanned_bytes)
+                if scanned_bytes and OCR_AVAILABLE else 0
+            )
+
+        scanned_sample = st.session_state.get("_bourret_scanned_sample")
+        rotation = 0
+        if scanned_sample and OCR_AVAILABLE:
+            st.info(
+                "📷 Detected a scanned PDF (no digital text) — OCR will be used to read it. "
+                "**Click the thumbnail that looks upright** before splitting (applies to all "
+                "scanned files in this batch)."
+            )
+            base_preview = _splitter_render_page_image(scanned_sample, 1, dpi=100)
+            rot_options = [0, 90, 180, 270]
+            if base_preview is not None:
+                thumb_cols = st.columns(4)
+                for col, angle in zip(thumb_cols, rot_options):
+                    with col:
+                        thumb = base_preview.rotate(angle, expand=True) if angle else base_preview
+                        st.image(thumb, caption=f"{angle}°" if angle else "0° (no change)",
+                                  use_container_width=True)
+            rotation = st.radio(
+                "Rotation to apply",
+                options=rot_options,
+                index=rot_options.index(st.session_state.get("bourret_rotation", 0)),
+                format_func=lambda a: f"{a}°" if a else "0° (no change)",
+                horizontal=True,
+                key="bourret_rotation_radio",
+            )
+            st.session_state["bourret_rotation"] = rotation
+        elif scanned_sample and not OCR_AVAILABLE:
+            st.warning(
+                "⚠️ This PDF looks scanned (no digital text) but OCR isn't available in "
+                "this environment — invoices won't be detected."
+            )
+
+        do_split_bourret = st.button("✂️ Split Invoices", type="primary",
+                                      use_container_width=False, key="bourret_split_btn")
+
+        if do_split_bourret:
+            st.session_state.bourret_results = []
+            st.session_state.bourret_zip     = None
+            all_results = []
+            prog = st.progress(0, text="Processing…")
+
+            for f_idx, f in enumerate(bourret_uploads):
+                prog.progress((f_idx) / len(bourret_uploads),
+                              text=f"Splitting {f.name}…")
+
+                def _bourret_progress(cur_page, total_pg, _fname=f.name, _fi=f_idx):
+                    frac = (_fi + (cur_page / total_pg if total_pg else 1)) / len(bourret_uploads)
+                    prog.progress(min(frac, 0.999),
+                                  text=f"OCR {_fname}: page {cur_page}/{total_pg}…")
+
+                try:
+                    batch_results = split_bourret_batch_pdf(
+                        f.read(), rotation=rotation, progress_callback=_bourret_progress
+                    )
+                    for r in batch_results:
+                        r["source_file"] = f.name
+                    all_results.extend(batch_results)
+                except Exception as e:
+                    st.error(f"Error processing **{f.name}**: {e}")
+
+            prog.progress(1.0, text="✅ Done")
+            st.session_state.bourret_results = all_results
+            if all_results:
+                st.session_state.bourret_zip = make_bourret_zip(all_results)
+            st.rerun()
+
+    # ── Results display ───────────────────────────────────────────────────────
+    bourret_results = st.session_state.bourret_results
+
+    if bourret_results:
+        n_ok   = sum(1 for r in bourret_results if not r["warning"])
+        n_warn = sum(1 for r in bourret_results if r["warning"])
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num blue'>{len(bourret_results)}</div>"
+                f"<div class='stat-lbl'>Invoices detected</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num green'>{n_ok}</div>"
+                f"<div class='stat-lbl'>Ready to download</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"<div class='stat-num amber'>{n_warn}</div>"
+                f"<div class='stat-lbl'>Need review</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.session_state.bourret_zip:
+            st.download_button(
+                f"⬇️ Download all as ZIP ({len(bourret_results)} invoices)",
+                data=st.session_state.bourret_zip,
+                file_name=f"bourret_invoices_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                type="primary",
+                key="bourret_zip_dl",
+            )
+
+        st.divider()
+
+        for row_idx, item in enumerate(bourret_results):
+            row_cls = "split-row split-warn" if item["warning"] else "split-row"
+            icon    = "⚠️" if item["warning"] else "✅"
+
+            col_info, col_dl = st.columns([5, 1])
+            with col_info:
+                pages_str = ", ".join(str(p) for p in item["source_pages"])
+                page_lbl  = f"{item['page_count']} page{'s' if item['page_count'] > 1 else ''}"
+                warn_html = (
+                    f"<br><span style='color:#e08000;font-size:12px'>{item['warning']}</span>"
+                    if item["warning"] else ""
+                )
+                st.markdown(
+                    f"<div class='{row_cls}'>"
+                    f"{icon} <b>{item['filename']}</b>"
+                    f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                    f"Invoice: <code>{item['invoice_no']}</code> &nbsp; "
+                    f"POD: <code>{item['pod_no']}</code> &nbsp; "
+                    f"· {page_lbl} (source p. {pages_str})"
+                    f"{warn_html}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with col_dl:
+                st.download_button(
+                    "⬇️",
+                    data=item["pdf_bytes"],
+                    file_name=item["filename"],
+                    mime="application/pdf",
+                    key=f"bourretdl_{row_idx}",
+                    use_container_width=True,
+                    help=f"Download {item['filename']}",
+                )
+
+    elif not bourret_uploads:
+        st.info("📂 Upload one or more Transport Bourret batch PDFs to get started.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
