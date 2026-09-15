@@ -1216,14 +1216,14 @@ def calc_due_date(invoice_date) -> "date | None":
     return date(base.year, base.month, 30)
 
 
-def _supplier_profile_due_date(invoice_date) -> "date | None":
+def _bourret_due_date(invoice_date) -> "date | None":
     """
-    Bourret and Proden's payment terms are configured once in the vendor's
-    own profile inside the accounting system (not chosen per invoice, unlike
-    Atlantic's quincena rule above) and always resolve to the 15th of the
-    calendar month right after the invoice date — confirmed against a real
-    posted A/P Voucher Audit Listing (8 distinct invoice dates across 2
-    months, 100% match).
+    Bourret's payment terms are configured in its own vendor profile inside
+    the accounting system (not chosen per invoice, unlike Atlantic's
+    quincena rule above) and always resolve to the 15th of the calendar
+    month right after the invoice date — confirmed against a real posted
+    A/P Voucher Audit Listing (8 distinct invoice dates across 2 months,
+    100% match).
     """
     if invoice_date is None:
         return None
@@ -1231,6 +1231,16 @@ def _supplier_profile_due_date(invoice_date) -> "date | None":
     if m > 12:
         y, m = y + 1, 1
     return date(y, m, 15)
+
+
+def _proden_due_date(invoice_date) -> "date | None":
+    """Proden's vendor profile uses a plain Net-30 term — due date is
+    exactly 30 calendar days after the invoice date, no rounding. Confirmed
+    against a real posted A/P Voucher Audit Listing (4 invoices, 100% match)
+    — unlike Bourret, whose own profile rounds up to the 15th instead."""
+    if invoice_date is None:
+        return None
+    return invoice_date + timedelta(days=30)
 
 
 def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
@@ -1414,8 +1424,10 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             mv = re.search(r'(?:^|\s)(\d{1,4})\s+APINV\b', row_tx, re.IGNORECASE)
             voucher_no = mv.group(1) if mv else None
 
-            # Regex on joined row text (works when APINV and number share a band)
-            m = re.search(r'APINV\s+(\d{7,10})\b', row_tx, re.IGNORECASE)
+            # Regex on joined row text (works when APINV and number share a band).
+            # 6 digits covers Proden's invoice numbers (e.g. 308824); 7-10
+            # covers Atlantic's and Bourret's.
+            m = re.search(r'APINV\s+(\d{6,10})\b', row_tx, re.IGNORECASE)
             if m:
                 apinv_rows.append((yk, m.group(1), voucher_no))
                 continue
@@ -1431,7 +1443,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 found = False
                 for ny in nearby:
                     for w in sorted(row_map[ny], key=lambda w: w["x0"]):
-                        if w["x0"] >= apinv_x1 - 5 and re.match(r'^\d{7,10}$', w["text"]):
+                        if w["x0"] >= apinv_x1 - 5 and re.match(r'^\d{6,10}$', w["text"]):
                             apinv_rows.append((yk, w["text"], voucher_no))
                             found = True
                             break
@@ -1456,18 +1468,25 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             if mv:
                 vendor = mv.group(1)
 
-            # GL: 6 digits starting with 3
-            gl = None
-            mg = re.search(r'\b(3\d{5})\b', block_text)
-            if mg:
-                gl = mg.group(1)
-
             # CC: known values only
             cc = None
+            cc_end = 0
             for mc in re.finditer(r'\b([A-Z]{2}\d{2})\b', block_text):
                 if mc.group(1).upper() in known_ccs:
                     cc = mc.group(1).upper()
+                    cc_end = mc.end()
                     break
+
+            # GL: 6 digits starting with 3. Searched only in the text AFTER
+            # the CC match (which always precedes GL in the layout) — some
+            # suppliers' invoice numbers (e.g. Proden's, like 308824) also
+            # happen to be 6 digits starting with 3, and appear earlier in
+            # the block, so searching the whole block can match the invoice
+            # number instead of the real GL.
+            gl = None
+            mg = re.search(r'\b(3\d{5})\b', block_text[cc_end:])
+            if mg:
+                gl = mg.group(1)
 
             # Invoice date: the date printed ON THE SAME LINE as the APINV /
             # invoice-number row (±6 pt — Crystal Reports row tolerance).
@@ -3920,7 +3939,7 @@ if active_module == "audit":
                     lines      = [ln.strip() for ln in peek_text.splitlines() if ln.strip()]
                     invoice_no, _pod = _bourret_extract_ids(lines)
                     inv_date   = _bourret_extract_invoice_date(lines)
-                    exp_due    = _supplier_profile_due_date(inv_date)
+                    exp_due    = _bourret_due_date(inv_date)
                     inv_net    = None
                     inv_taxes  = None
                     inv_total  = _bourret_extract_total(raw)
@@ -3933,7 +3952,7 @@ if active_module == "audit":
                     fields     = _proden_parse_fields_from_text(peek_text)
                     invoice_no = fields["invoice_no"]
                     inv_date   = fields["invoice_date"]
-                    exp_due    = _supplier_profile_due_date(inv_date)
+                    exp_due    = _proden_due_date(inv_date)
                     inv_net    = None
                     inv_taxes  = None
                     inv_total  = fields["total"]
