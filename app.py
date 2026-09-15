@@ -3161,8 +3161,7 @@ if active_module == "bourretcoding":
     st.markdown(
         f"Upload Transport Bourret invoices (from the **Bourret Splitter**, or any single "
         f"invoice PDF). Vendor is always **`{BOURRET_VENDOR}`** for this carrier — pick the "
-        f"**GL** and **Cost Centre** to apply to the whole batch below, then override any "
-        f"individual invoice that's an exception."
+        f"**GL** and **Cost Centre** to apply to the whole batch and code them all at once."
     )
 
     if "bourretcoding_upload_key" not in st.session_state:
@@ -3170,11 +3169,9 @@ if active_module == "bourretcoding":
 
     col_gl, col_cc = st.columns(2)
     with col_gl:
-        batch_gl = st.selectbox("GL (applies to all, unless overridden below)",
-                                 BOURRET_GL_OPTIONS, key="bourretcoding_batch_gl")
+        batch_gl = st.selectbox("GL", BOURRET_GL_OPTIONS, key="bourretcoding_batch_gl")
     with col_cc:
-        batch_cc = st.selectbox("Cost Centre (applies to all, unless overridden below)",
-                                 BOURRET_CC_OPTIONS, key="bourretcoding_batch_cc")
+        batch_cc = st.selectbox("Cost Centre", BOURRET_CC_OPTIONS, key="bourretcoding_batch_cc")
 
     col_up, col_clear = st.columns([5, 1])
     with col_up:
@@ -3188,79 +3185,65 @@ if active_module == "bourretcoding":
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear", use_container_width=True, key="bourretcoding_clear"):
             st.session_state.bourretcoding_upload_key += 1
+            st.session_state.pop("_bourretcoding_sig", None)
+            st.session_state.pop("bourretcoding_last_batch", None)
             st.rerun()
 
+    exception_gl = {}
+    exception_cc = {}
+
     if bourretcoding_uploads:
-        st.divider()
-
-        # Cache raw bytes by upload signature so re-reading only happens
-        # when the file set actually changes, not on every widget rerun.
-        _sig = tuple((f.name, f.size) for f in bourretcoding_uploads)
-        if _sig != st.session_state.get("_bourretcoding_sig"):
-            st.session_state["_bourretcoding_raw"] = {
-                idx: f.read() for idx, f in enumerate(bourretcoding_uploads)
-            }
-            st.session_state["_bourretcoding_sig"] = _sig
-        raw_bytes_map = st.session_state["_bourretcoding_raw"]
-
-        resolved_gl = {}
-        resolved_cc = {}
-        for idx, f in enumerate(bourretcoding_uploads):
-            with st.expander(f"📄 {f.name}", expanded=False):
-                c1, c2 = st.columns(2)
-                with c1:
-                    sel_gl = st.selectbox(
-                        "GL", BOURRET_GL_OPTIONS,
-                        index=BOURRET_GL_OPTIONS.index(batch_gl),
-                        key=f"bourretcoding_gl_{idx}",
-                    )
-                with c2:
-                    sel_cc = st.selectbox(
-                        "Cost Centre", BOURRET_CC_OPTIONS,
-                        index=BOURRET_CC_OPTIONS.index(batch_cc),
-                        key=f"bourretcoding_cc_{idx}",
-                    )
-                resolved_gl[idx] = sel_gl
-                resolved_cc[idx] = sel_cc
-
-                usr_prev  = current_user or "???"
-                date_prev = coding_date.strftime("%d/%m/%Y")
-                st.markdown(f"""
-                <div style='margin-top:10px'>
-                <p style='margin-bottom:4px; color:gray; font-size:12px'>👁️ Stamp preview:</p>
-                <div class='stamp-preview'>
-                POSTED BY: {usr_prev}<br>
-                VENDOR: {BOURRET_VENDOR}<br>
-                CC: {sel_cc}&nbsp;&nbsp;|&nbsp;&nbsp;GL: {sel_gl}<br>
-                DATE: {date_prev}
-                </div></div>
-                """, unsafe_allow_html=True)
-
-        st.divider()
-        col_btn, col_info = st.columns([1, 3])
-        with col_btn:
-            do_process_bourret = st.button(
-                "🚀 Code Invoices",
-                type="primary",
-                use_container_width=True,
-                disabled=not bool(current_user),
-                key="bourretcoding_process_btn",
+        with st.expander(f"⚙️ Exceptions — override GL/CC for specific invoices "
+                          f"({len(bourretcoding_uploads)} loaded)"):
+            fname_list = [f.name for f in bourretcoding_uploads]
+            exception_files = st.multiselect(
+                "Invoice(s) that need a different GL/CC than the batch default above:",
+                fname_list, key="bourretcoding_exception_files",
             )
-        with col_info:
-            if not current_user:
-                st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
+            if exception_files:
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    exc_gl = st.selectbox("GL for selected exceptions", BOURRET_GL_OPTIONS,
+                                           key="bourretcoding_exc_gl")
+                with ec2:
+                    exc_cc = st.selectbox("Cost Centre for selected exceptions", BOURRET_CC_OPTIONS,
+                                           key="bourretcoding_exc_cc")
+                for fname in exception_files:
+                    exception_gl[fname] = exc_gl
+                    exception_cc[fname] = exc_cc
+
+        do_process_bourret = st.button(
+            "🚀 Code Invoices",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(current_user),
+            key="bourretcoding_process_btn",
+        )
+        if not current_user:
+            st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
 
         if do_process_bourret and current_user:
+            # Cache raw bytes by upload signature so re-reading only happens
+            # when the file set actually changes, not on every widget rerun.
+            _sig = tuple((f.name, f.size) for f in bourretcoding_uploads)
+            if _sig != st.session_state.get("_bourretcoding_sig"):
+                st.session_state["_bourretcoding_raw"] = {
+                    f.name: f.read() for f in bourretcoding_uploads
+                }
+                st.session_state["_bourretcoding_sig"] = _sig
+            raw_bytes_map = st.session_state["_bourretcoding_raw"]
+
             progress = st.progress(0, text="Starting…")
             errors = []
+            newly_coded = []
             for idx, f in enumerate(bourretcoding_uploads):
                 progress.progress((idx + 1) / len(bourretcoding_uploads), text=f"Coding {f.name}…")
-                gl = resolved_gl.get(idx, batch_gl)
-                cc = resolved_cc.get(idx, batch_cc)
+                gl = exception_gl.get(f.name, batch_gl)
+                cc = exception_cc.get(f.name, batch_cc)
                 try:
-                    raw = raw_bytes_map[idx]
+                    raw = raw_bytes_map[f.name]
                     stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date)
-                    st.session_state.processed.append({
+                    item = {
                         "filename":       f.name,
                         "original_bytes": raw,
                         "pdf_bytes":      stamped,
@@ -3272,27 +3255,60 @@ if active_module == "bourretcoding":
                         "date":           coding_date.strftime("%d/%m/%Y"),
                         "date_obj":       coding_date,
                         "ts":             datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    })
+                    }
+                    st.session_state.processed.append(item)
+                    newly_coded.append(item)
                 except Exception as e:
                     errors.append(f"{f.name}: {e}")
             progress.progress(1.0, text="✅ Done")
+            st.session_state["bourretcoding_last_batch"] = newly_coded
             if errors:
                 for err in errors:
                     st.error(err)
-            else:
-                st.success(f"🎉 **{len(bourretcoding_uploads)} invoice(s)** coded successfully.")
+            if newly_coded:
+                st.success(f"🎉 **{len(newly_coded)} invoice(s)** coded successfully.")
                 st.balloons()
 
-    elif not bourretcoding_uploads:
+    else:
         st.session_state.pop("_bourretcoding_sig", None)
         st.info("📂 Upload Transport Bourret invoices to get started.")
 
-    if st.session_state.processed:
+    # ── Results / download section for the most recently coded batch ──────────
+    last_batch = st.session_state.get("bourretcoding_last_batch")
+    if last_batch:
         st.divider()
-        st.caption(
-            f"📋 {len(st.session_state.processed)} coded invoice(s) so far — see the "
-            f"**Invoice Coding** tab or the sidebar ZIP download for the full results list."
-        )
+        n = len(last_batch)
+        col_hdr, col_zip = st.columns([3, 2])
+        with col_hdr:
+            st.subheader(f"📋 Coded Invoices — {n} file(s)")
+        with col_zip:
+            st.download_button(
+                f"⬇️ Download ZIP ({n})",
+                data=make_zip(last_batch),
+                file_name=f"bourret_coded_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+                key="bourretcoding_zip_dl",
+            )
+        st.divider()
+        for i, item in enumerate(last_batch):
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.markdown(
+                    f"📄 **{item['filename']}**&nbsp;&nbsp;|&nbsp;&nbsp;"
+                    f"CC: <code>{item['cc']}</code> &nbsp; GL: <code>{item['gl']}</code>",
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.download_button(
+                    "⬇️",
+                    data=item["pdf_bytes"],
+                    file_name=item["filename"],
+                    mime="application/pdf",
+                    key=f"bourretcoding_dl_{i}",
+                    use_container_width=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
