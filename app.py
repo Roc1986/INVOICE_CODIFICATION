@@ -811,6 +811,12 @@ def _proden_extract_backup_code(filename: str) -> "str | None":
     return None
 
 
+def _proden_fiscal_period(coding_date) -> str:
+    """Proden's accounting period follows a fiscal year starting in June:
+    June=01, July=02, August=03, September=04, ... May=12."""
+    return f"{((coding_date.month - 6) % 12) + 1:02d}"
+
+
 def make_zip(items):
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -3435,7 +3441,7 @@ if active_module == "prodencoding":
                 st.session_state["_prodencoding_sig"] = _sig
             raw_bytes_map = st.session_state["_prodencoding_raw"]
 
-            period = coding_date.strftime("%m")
+            period = _proden_fiscal_period(coding_date)
             progress = st.progress(0, text="Starting…")
             errors = []
             warnings = []
@@ -3450,18 +3456,18 @@ if active_module == "prodencoding":
                         warnings.append(f"{f.name}: subtotal not found in PDF — using '??'")
 
                     lines = [
-                        f"VENDOR : {PRODEN_VENDOR}",
-                        f"GL : {batch_gl} - {PRODEN_CC}",
-                        f"PERIOD : {period}",
-                        f"POSTED BY : {current_user}",
+                        f"POSTED BY: {current_user}",
+                        f"VENDOR: {PRODEN_VENDOR}",
+                        f"CC: {PRODEN_CC}  |  GL: {batch_gl}",
+                        f"PERIOD: {period}",
                     ]
                     if batch_gl == "300016":
                         backup_code = _proden_extract_backup_code(f.name)
                         if not backup_code:
                             warnings.append(f"{f.name}: no backup code found in filename — using '??'")
-                        lines.append(f"BACKUP : {backup_code or '??'} - {amount_str}")
+                        lines.append(f"BACKUP: {backup_code or '??'} - {amount_str}")
                     else:
-                        lines.append(f"AMOUNT : {amount_str}")
+                        lines.append(f"AMOUNT: {amount_str}")
 
                     stamped = process_one(raw, current_user, PRODEN_VENDOR, PRODEN_CC, batch_gl,
                                            coding_date, geometry=PRODEN_STAMP_GEOMETRY,
