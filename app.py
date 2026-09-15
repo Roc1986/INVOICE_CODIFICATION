@@ -96,6 +96,10 @@ VENDOR_EXCEPCION = "0101000390"
 BOURRET_VENDOR     = "0402000870"
 BOURRET_GL_OPTIONS = ["315001", "975001"]
 BOURRET_CC_OPTIONS = ["EV01", "ML01", "MV01"]
+# (x, y-top measured from the page bottom, width, height) — positioned in the
+# blank area below the invoice's totals block, matching where the user marked
+# it on their sample invoice so the stamp never covers the freight details.
+BOURRET_STAMP_GEOMETRY = (60, 260, 175, 72)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE INIT
@@ -664,9 +668,21 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
     return result
 
 
-def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0):
-    sw = st.session_state.stamp_w
-    sh = st.session_state.stamp_h
+def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0, geometry=None):
+    """
+    geometry, when given, overrides the globally-configured stamp position/size
+    (st.session_state.stamp_*, set in Settings) with an explicit
+    (x, y_top_from_bottom, width, height) tuple — used for invoice formats
+    whose safe stamping area differs from Atlantic's own invoices, such as
+    Transport Bourret's.
+    """
+    if geometry:
+        sx, sy_top, sw, sh = geometry
+    else:
+        sx     = st.session_state.stamp_x
+        sy_top = st.session_state.stamp_y_top
+        sw     = st.session_state.stamp_w
+        sh     = st.session_state.stamp_h
     margin = 18
     date_str = (coding_date.strftime("%d/%m/%Y")
                 if hasattr(coding_date, "strftime") else str(coding_date))
@@ -704,8 +720,6 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0):
             c.drawString(tx, ty - i * line_h, line)
         c.restoreState()
     else:
-        sx = st.session_state.stamp_x
-        sy_top = st.session_state.stamp_y_top
         sy_bot = sy_top - sh
         c.setStrokeColorRGB(0.85, 0.0, 0.0)
         c.setFillColorRGB(1.0, 1.0, 1.0)
@@ -738,13 +752,13 @@ def stamp_pdf(original_bytes, stamp_bytes):
     return out.read()
 
 
-def process_one(original_bytes, user, vendor, cc, gl, coding_date):
+def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None):
     reader = PdfReader(BytesIO(original_bytes))
     page = reader.pages[0]
     pw = float(page.mediabox.width)
     ph = float(page.mediabox.height)
     rotation = int(page.get("/Rotate", 0) or 0)
-    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph, rotation)
+    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph, rotation, geometry=geometry)
     return stamp_pdf(original_bytes, stamp_bytes)
 
 
@@ -3242,7 +3256,8 @@ if active_module == "bourretcoding":
                 cc = exception_cc.get(f.name, batch_cc)
                 try:
                     raw = raw_bytes_map[f.name]
-                    stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date)
+                    stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date,
+                                           geometry=BOURRET_STAMP_GEOMETRY)
                     item = {
                         "filename":       f.name,
                         "original_bytes": raw,
