@@ -827,6 +827,30 @@ def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None
 # ── PRODEN CODING FUNCTIONS ───────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ocr_page1_best(pdf_bytes: bytes, dpis=(200, 300, 150)) -> str:
+    """
+    OCR page 1, trying a few DPIs and keeping the longest result. Tesseract's
+    automatic layout analysis can, for a bordered-table region, silently
+    drop a row or two at one DPI while reading it fine at another — observed
+    on a real invoice where the "# Facture" / "Date" table rows vanished at
+    200 dpi specifically but came through fine at both 150 and 300 dpi.
+    Trying a few candidates and keeping the longest recovers from this
+    instead of silently losing a field (and, downstream, failing to match
+    the invoice in the AP Audit at all).
+    """
+    if not OCR_AVAILABLE:
+        return ""
+    best = ""
+    for dpi in dpis:
+        img = _splitter_render_page_image(pdf_bytes, 1, dpi=dpi)
+        if img is None:
+            continue
+        candidate = pytesseract.image_to_string(img)
+        if len(candidate.strip()) > len(best.strip()):
+            best = candidate
+    return best
+
+
 def _proden_get_text(pdf_bytes: bytes) -> tuple:
     """
     Page-1 text for a Proden invoice, falling back to OCR when the text
@@ -839,12 +863,8 @@ def _proden_get_text(pdf_bytes: bytes) -> tuple:
         text = pdf.pages[0].extract_text() or ""
     if text.strip():
         return text, False
-    if not OCR_AVAILABLE:
-        return "", False
-    img = _splitter_render_page_image(pdf_bytes, 1, dpi=200)
-    if img is None:
-        return "", False
-    return pytesseract.image_to_string(img), True
+    ocr_text = _ocr_page1_best(pdf_bytes)
+    return ocr_text, bool(ocr_text)
 
 
 def _proden_extract_subtotal(pdf_bytes: bytes) -> tuple:
@@ -865,11 +885,19 @@ def _proden_parse_fields_from_text(text: str) -> dict:
     instead of re-reading the PDF."""
     result = {"invoice_no": None, "invoice_date": None, "total": None}
 
-    m = re.search(r"#\s*Facture\s*:?\s*(\d{4,8})", text, re.IGNORECASE)
+    # A misread colon can OCR as a spurious leading digit (e.g. "# Facture
+    # :305919" -> "# Facture 1305919"), so take the LAST 6 digits of
+    # whatever run follows "Facture" rather than the first N — Proden's
+    # invoice numbers are consistently 6 digits, and a well-formed match
+    # (colon read correctly, digits on their own) is already exactly 6, so
+    # this is a no-op there.
+    m = re.search(r"#\s*Facture\s*:?\s*(\d{4,10})", text, re.IGNORECASE)
     if m:
-        result["invoice_no"] = m.group(1)
+        digits = m.group(1)
+        result["invoice_no"] = digits[-6:] if len(digits) > 6 else digits
 
-    m = re.search(r"Date\s*:\s*(\d{4})\.(\d{2})\.(\d{2})", text)
+    # Colon made optional here too, for the same OCR-dropped-colon reason.
+    m = re.search(r"Date\s*:?\s*(\d{4})\.(\d{2})\.(\d{2})", text)
     if m:
         y, mo, d = (int(g) for g in m.groups())
         try:
@@ -3925,11 +3953,9 @@ if active_module == "audit":
                 with pdfplumber.open(BytesIO(raw)) as _pdf:
                     peek_text = _pdf.pages[0].extract_text() or ""
                 if len(peek_text.strip()) < 200 and OCR_AVAILABLE:
-                    _img = _splitter_render_page_image(raw, 1, dpi=200)
-                    if _img is not None:
-                        ocr_text = pytesseract.image_to_string(_img)
-                        if len(ocr_text.strip()) > len(peek_text.strip()):
-                            peek_text = ocr_text
+                    ocr_text = _ocr_page1_best(raw)
+                    if len(ocr_text.strip()) > len(peek_text.strip()):
+                        peek_text = ocr_text
                 kind = _detect_invoice_kind(peek_text)
 
                 if kind == "bourret":
