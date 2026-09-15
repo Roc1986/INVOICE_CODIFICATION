@@ -101,6 +101,17 @@ BOURRET_CC_OPTIONS = ["EV01", "ML01", "MV01"]
 # it on their sample invoice so the stamp never covers the freight details.
 BOURRET_STAMP_GEOMETRY = (60, 260, 175, 72)
 
+# Les Entreprises Proden always codes to the same AP vendor and cost centre —
+# only the GL changes, and it changes the stamp's shape: GL 300009 shows the
+# invoice subtotal, GL 300016 shows a "BACKUP" reference (taken from the
+# invoice filename) instead.
+PRODEN_VENDOR     = "0116000440"
+PRODEN_CC         = "ML01"
+PRODEN_GL_OPTIONS = ["300009", "300016"]
+# Positioned where the user marked it (arrow) on their sample invoice — the
+# blank band between the totals block and the notes section.
+PRODEN_STAMP_GEOMETRY = (80, 285, 220, 90)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -668,13 +679,19 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
     return result
 
 
-def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0, geometry=None):
+def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0,
+                  geometry=None, lines_override=None):
     """
     geometry, when given, overrides the globally-configured stamp position/size
     (st.session_state.stamp_*, set in Settings) with an explicit
     (x, y_top_from_bottom, width, height) tuple — used for invoice formats
     whose safe stamping area differs from Atlantic's own invoices, such as
-    Transport Bourret's.
+    Transport Bourret's or Proden's.
+
+    lines_override, when given, replaces the default 4-line POSTED BY / VENDOR
+    / CC+GL / DATE layout with an arbitrary list of lines — used by formats
+    whose stamp content varies by more than just these four fields, such as
+    Proden's GL-dependent AMOUNT/BACKUP line.
     """
     if geometry:
         sx, sy_top, sw, sh = geometry
@@ -684,14 +701,17 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0, 
         sw     = st.session_state.stamp_w
         sh     = st.session_state.stamp_h
     margin = 18
-    date_str = (coding_date.strftime("%d/%m/%Y")
-                if hasattr(coding_date, "strftime") else str(coding_date))
-    stamp_lines = [
-        f"POSTED BY: {user}",
-        f"VENDOR: {vendor}",
-        f"CC: {cc}  |  GL: {gl}",
-        f"DATE: {date_str}",
-    ]
+    if lines_override is not None:
+        stamp_lines = lines_override
+    else:
+        date_str = (coding_date.strftime("%d/%m/%Y")
+                    if hasattr(coding_date, "strftime") else str(coding_date))
+        stamp_lines = [
+            f"POSTED BY: {user}",
+            f"VENDOR: {vendor}",
+            f"CC: {cc}  |  GL: {gl}",
+            f"DATE: {date_str}",
+        ]
     packet = BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     if rotation in (90, 270):
@@ -714,7 +734,7 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0, 
         c.rect(lx, ly, sw, sh, fill=1)
         c.setFillColorRGB(0.85, 0.0, 0.0)
         c.setFont("Helvetica-Bold", 8.5)
-        line_h = sh / 5.2
+        line_h = sh / (len(stamp_lines) + 1.2)
         tx, ty = lx + 10, ly + sh - line_h
         for i, line in enumerate(stamp_lines):
             c.drawString(tx, ty - i * line_h, line)
@@ -727,7 +747,7 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0, 
         c.rect(sx, sy_bot, sw, sh, fill=1)
         c.setFillColorRGB(0.85, 0.0, 0.0)
         c.setFont("Helvetica-Bold", 8.5)
-        line_h = sh / 5.2
+        line_h = sh / (len(stamp_lines) + 1.2)
         tx, ty = sx + 10, sy_bot + sh - line_h
         for i, line in enumerate(stamp_lines):
             c.drawString(tx, ty - i * line_h, line)
@@ -752,14 +772,43 @@ def stamp_pdf(original_bytes, stamp_bytes):
     return out.read()
 
 
-def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None):
+def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None, lines_override=None):
     reader = PdfReader(BytesIO(original_bytes))
     page = reader.pages[0]
     pw = float(page.mediabox.width)
     ph = float(page.mediabox.height)
     rotation = int(page.get("/Rotate", 0) or 0)
-    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph, rotation, geometry=geometry)
+    stamp_bytes = create_stamp(user, vendor, cc, gl, coding_date, pw, ph, rotation,
+                                geometry=geometry, lines_override=lines_override)
     return stamp_pdf(original_bytes, stamp_bytes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── PRODEN CODING FUNCTIONS ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _proden_extract_subtotal(pdf_bytes: bytes) -> "float | None":
+    """The 'Sous total' (subtotal before taxes) always appears as
+    'Sous total <amount>' on one line once pdfplumber joins the page's text."""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+    m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", ""))
+
+
+def _proden_extract_backup_code(filename: str) -> "str | None":
+    """
+    The backup reference (needed only for GL 300016) is encoded in the
+    filename itself, after the invoice/order numbers, e.g.:
+        308824_MLQD84975 - MLIN1532994.pdf  ->  "MLIN1532994"
+        308883_MLQD86143.pdf                ->  None (no backup)
+    """
+    stem = re.sub(r"\.pdf$", "", filename, flags=re.IGNORECASE)
+    if " - " in stem:
+        return stem.split(" - ", 1)[1].strip()
+    return None
 
 
 def make_zip(items):
@@ -2172,6 +2221,7 @@ MODULES = [
     {"key": "matcher",  "icon": "🔗", "label": "Invoice Matcher",   "desc": "Match invoices with POs and merge into one PDF."},
     {"key": "coding",   "icon": "🏷️",  "label": "Invoice Coding",    "desc": "Stamp GL / Cost Centre codes on invoices."},
     {"key": "bourretcoding", "icon": "🧾", "label": "Bourret Coding", "desc": "Bulk-code Transport Bourret invoices (fixed vendor, choose GL & CC)."},
+    {"key": "prodencoding", "icon": "📑", "label": "Proden Coding", "desc": "Bulk-code Les Entreprises Proden invoices (fixed vendor, choose GL)."},
     {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
     {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
     {"key": "recon",    "icon": "🧮", "label": "Statement Reconciliation", "desc": "Reconcile Atlantic's statement against the system and invoice copies."},
@@ -3322,6 +3372,166 @@ if active_module == "bourretcoding":
                     file_name=item["filename"],
                     mime="application/pdf",
                     key=f"bourretcoding_dl_{i}",
+                    use_container_width=True,
+                )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3C — PRODEN CODING
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "prodencoding":
+    st.subheader("📑 Proden Invoice Coding")
+    st.markdown(
+        f"Upload Les Entreprises Proden invoices. Vendor is always **`{PRODEN_VENDOR}`** and "
+        f"Cost Centre is always **`{PRODEN_CC}`** for this supplier — pick the **GL** for the "
+        f"whole batch and code them all at once:\n"
+        f"- **GL 300009** — stamps the invoice's subtotal (read from the PDF) as `AMOUNT`.\n"
+        f"- **GL 300016** — stamps a `BACKUP` reference instead, taken from the invoice "
+        f"filename (the part after \" - \", e.g. `... - MLIN1532994.pdf`), together with the "
+        f"same subtotal."
+    )
+
+    if "prodencoding_upload_key" not in st.session_state:
+        st.session_state.prodencoding_upload_key = 0
+
+    batch_gl = st.selectbox("GL (applies to the whole batch)", PRODEN_GL_OPTIONS,
+                             key="prodencoding_batch_gl")
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        prodencoding_uploads = st.file_uploader(
+            "Drag or select one or more Proden invoice PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"prodencoding_uploader_{st.session_state.prodencoding_upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="prodencoding_clear"):
+            st.session_state.prodencoding_upload_key += 1
+            st.session_state.pop("_prodencoding_sig", None)
+            st.session_state.pop("prodencoding_last_batch", None)
+            st.rerun()
+
+    if prodencoding_uploads:
+        do_process_proden = st.button(
+            "🚀 Code Invoices",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(current_user),
+            key="prodencoding_process_btn",
+        )
+        if not current_user:
+            st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
+
+        if do_process_proden and current_user:
+            # Cache raw bytes by upload signature so re-reading only happens
+            # when the file set actually changes, not on every widget rerun.
+            _sig = tuple((f.name, f.size) for f in prodencoding_uploads)
+            if _sig != st.session_state.get("_prodencoding_sig"):
+                st.session_state["_prodencoding_raw"] = {
+                    f.name: f.read() for f in prodencoding_uploads
+                }
+                st.session_state["_prodencoding_sig"] = _sig
+            raw_bytes_map = st.session_state["_prodencoding_raw"]
+
+            period = coding_date.strftime("%m")
+            progress = st.progress(0, text="Starting…")
+            errors = []
+            warnings = []
+            newly_coded = []
+            for idx, f in enumerate(prodencoding_uploads):
+                progress.progress((idx + 1) / len(prodencoding_uploads), text=f"Coding {f.name}…")
+                try:
+                    raw = raw_bytes_map[f.name]
+                    subtotal = _proden_extract_subtotal(raw)
+                    amount_str = f"${subtotal:.0f}" if subtotal is not None else "??"
+                    if subtotal is None:
+                        warnings.append(f"{f.name}: subtotal not found in PDF — using '??'")
+
+                    lines = [
+                        f"VENDOR : {PRODEN_VENDOR}",
+                        f"GL : {batch_gl} - {PRODEN_CC}",
+                        f"PERIOD : {period}",
+                        f"POSTED BY : {current_user}",
+                    ]
+                    if batch_gl == "300016":
+                        backup_code = _proden_extract_backup_code(f.name)
+                        if not backup_code:
+                            warnings.append(f"{f.name}: no backup code found in filename — using '??'")
+                        lines.append(f"BACKUP : {backup_code or '??'} - {amount_str}")
+                    else:
+                        lines.append(f"AMOUNT : {amount_str}")
+
+                    stamped = process_one(raw, current_user, PRODEN_VENDOR, PRODEN_CC, batch_gl,
+                                           coding_date, geometry=PRODEN_STAMP_GEOMETRY,
+                                           lines_override=lines)
+                    item = {
+                        "filename":       f.name,
+                        "original_bytes": raw,
+                        "pdf_bytes":      stamped,
+                        "invoice_no":     None,
+                        "vendor":         PRODEN_VENDOR,
+                        "cc":             PRODEN_CC,
+                        "gl":             batch_gl,
+                        "user":           current_user,
+                        "date":           coding_date.strftime("%d/%m/%Y"),
+                        "date_obj":       coding_date,
+                        "ts":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                    st.session_state.processed.append(item)
+                    newly_coded.append(item)
+                except Exception as e:
+                    errors.append(f"{f.name}: {e}")
+            progress.progress(1.0, text="✅ Done")
+            st.session_state["prodencoding_last_batch"] = newly_coded
+            if errors:
+                for err in errors:
+                    st.error(err)
+            if warnings:
+                for w in warnings:
+                    st.warning(f"⚠️ {w}")
+            if newly_coded:
+                st.success(f"🎉 **{len(newly_coded)} invoice(s)** coded successfully.")
+                st.balloons()
+
+    else:
+        st.session_state.pop("_prodencoding_sig", None)
+        st.info("📂 Upload Les Entreprises Proden invoices to get started.")
+
+    # ── Results / download section for the most recently coded batch ──────────
+    last_batch = st.session_state.get("prodencoding_last_batch")
+    if last_batch:
+        st.divider()
+        n = len(last_batch)
+        col_hdr, col_zip = st.columns([3, 2])
+        with col_hdr:
+            st.subheader(f"📋 Coded Invoices — {n} file(s)")
+        with col_zip:
+            st.download_button(
+                f"⬇️ Download ZIP ({n})",
+                data=make_zip(last_batch),
+                file_name=f"proden_coded_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+                key="prodencoding_zip_dl",
+            )
+        st.divider()
+        for i, item in enumerate(last_batch):
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.markdown(
+                    f"📄 **{item['filename']}**&nbsp;&nbsp;|&nbsp;&nbsp;GL: <code>{item['gl']}</code>",
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.download_button(
+                    "⬇️",
+                    data=item["pdf_bytes"],
+                    file_name=item["filename"],
+                    mime="application/pdf",
+                    key=f"prodencoding_dl_{i}",
                     use_container_width=True,
                 )
 
