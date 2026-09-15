@@ -787,15 +787,33 @@ def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None
 # ── PRODEN CODING FUNCTIONS ───────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _proden_extract_subtotal(pdf_bytes: bytes) -> "float | None":
-    """The 'Sous total' (subtotal before taxes) always appears as
-    'Sous total <amount>' on one line once pdfplumber joins the page's text."""
+def _proden_extract_subtotal(pdf_bytes: bytes) -> tuple:
+    """
+    The 'Sous total' (subtotal before taxes) always appears as
+    'Sous total <amount>' on one line once pdfplumber joins the page's text.
+
+    Some Proden invoices are exported with their body drawn as vector
+    outlines instead of real embedded text (no font, so pdfplumber finds
+    nothing at all) — those fall back to OCR automatically.
+
+    Returns (amount, ocr_used); amount is None if not found either way.
+    """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         text = pdf.pages[0].extract_text() or ""
     m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if m:
+        return float(m.group(1).replace(",", "")), False
+
+    if not OCR_AVAILABLE:
+        return None, False
+    img = _splitter_render_page_image(pdf_bytes, 1, dpi=200)
+    if img is None:
+        return None, False
+    ocr_text = pytesseract.image_to_string(img)
+    m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", ocr_text, re.IGNORECASE)
     if not m:
-        return None
-    return float(m.group(1).replace(",", ""))
+        return None, True
+    return float(m.group(1).replace(",", "")), True
 
 
 def _proden_extract_backup_code(filename: str) -> "str | None":
@@ -3450,10 +3468,12 @@ if active_module == "prodencoding":
                 progress.progress((idx + 1) / len(prodencoding_uploads), text=f"Coding {f.name}…")
                 try:
                     raw = raw_bytes_map[f.name]
-                    subtotal = _proden_extract_subtotal(raw)
+                    subtotal, subtotal_via_ocr = _proden_extract_subtotal(raw)
                     amount_str = f"${subtotal:.0f}" if subtotal is not None else "??"
                     if subtotal is None:
                         warnings.append(f"{f.name}: subtotal not found in PDF — using '??'")
+                    elif subtotal_via_ocr:
+                        warnings.append(f"{f.name}: 📷 subtotal read via OCR (no text layer) — please double-check")
 
                     lines = [
                         f"POSTED BY: {current_user}",
