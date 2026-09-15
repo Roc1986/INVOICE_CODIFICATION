@@ -463,6 +463,46 @@ def _bourret_extract_ids(lines: list) -> tuple:
     return None, None
 
 
+def _bourret_extract_invoice_date(lines: list) -> "date | None":
+    """The invoice date is the first DD-MM-YYYY date right after the invoice
+    number / 'TRANSPORT BOURRET INC.' marker (see _bourret_extract_ids)."""
+    for i, line in enumerate(lines):
+        if "TRANSPORT BOURRET" in line.upper():
+            if not (i > 0 and re.fullmatch(r"\d{6,10}", lines[i - 1].strip())):
+                continue
+            for ln in lines[i + 1:i + 4]:
+                m = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", ln.strip())
+                if m:
+                    dd, mm, yyyy = (int(g) for g in m.groups())
+                    try:
+                        return date(yyyy, mm, dd)
+                    except ValueError:
+                        return None
+            break
+    return None
+
+
+def _bourret_extract_total(pdf_bytes: bytes) -> "float | None":
+    """Finds the 'Total' row (not 'Sous-total / Sub-total') via word
+    positions and reads the amount next to it — Bourret's two-column layout
+    interleaves labels and values in a way plain joined text can't reflow."""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        words = pdf.pages[0].extract_words(x_tolerance=3, y_tolerance=3)
+    rows: dict = {}
+    for w in words:
+        yk = round(w["top"] / 4) * 4
+        rows.setdefault(yk, []).append(w)
+    for yk in sorted(rows):
+        row_ws = sorted(rows[yk], key=lambda w: w["x0"])
+        row_tx = " ".join(w["text"] for w in row_ws).upper()
+        if "TOTAL" in row_tx and "SOUS" not in row_tx and "SUB" not in row_tx:
+            for w in row_ws:
+                clean = w["text"].replace(",", "").replace("$", "")
+                if re.fullmatch(r"\d+\.\d{2}", clean):
+                    return float(clean)
+    return None
+
+
 def _bourret_suggest_rotation(pdf_bytes: bytes, sample_pages: int = 3) -> int:
     """Same idea as _splitter_suggest_rotation, scored against the Bourret
     invoice/POD pattern instead of the Atlantic one."""
@@ -787,33 +827,70 @@ def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None
 # ── PRODEN CODING FUNCTIONS ───────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _proden_extract_subtotal(pdf_bytes: bytes) -> tuple:
+def _proden_get_text(pdf_bytes: bytes) -> tuple:
     """
-    The 'Sous total' (subtotal before taxes) always appears as
-    'Sous total <amount>' on one line once pdfplumber joins the page's text.
-
-    Some Proden invoices are exported with their body drawn as vector
-    outlines instead of real embedded text (no font, so pdfplumber finds
-    nothing at all) — those fall back to OCR automatically.
-
-    Returns (amount, ocr_used); amount is None if not found either way.
+    Page-1 text for a Proden invoice, falling back to OCR when the text
+    layer is empty. Some Proden invoices are exported with their body drawn
+    as vector outlines instead of real embedded text (no font at all), so
+    pdfplumber's extract_text() finds nothing even though the page is fully
+    legible. Returns (text, ocr_used).
     """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         text = pdf.pages[0].extract_text() or ""
-    m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1).replace(",", "")), False
-
+    if text.strip():
+        return text, False
     if not OCR_AVAILABLE:
-        return None, False
+        return "", False
     img = _splitter_render_page_image(pdf_bytes, 1, dpi=200)
     if img is None:
-        return None, False
-    ocr_text = pytesseract.image_to_string(img)
-    m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", ocr_text, re.IGNORECASE)
+        return "", False
+    return pytesseract.image_to_string(img), True
+
+
+def _proden_extract_subtotal(pdf_bytes: bytes) -> tuple:
+    """The 'Sous total' (subtotal before taxes) always appears as
+    'Sous total <amount>' on one line once the page's text is joined.
+    Returns (amount, ocr_used); amount is None if not found."""
+    text, ocr_used = _proden_get_text(pdf_bytes)
+    m = re.search(r"Sous\s+total\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
     if not m:
-        return None, True
-    return float(m.group(1).replace(",", "")), True
+        return None, ocr_used
+    return float(m.group(1).replace(",", "")), ocr_used
+
+
+def _proden_parse_fields_from_text(text: str) -> dict:
+    """Pure regex extraction of invoice number / date / total from a Proden
+    invoice's page-1 text — split out from _proden_extract_invoice_fields so
+    the AP Audit can reuse text it already fetched (possibly via OCR)
+    instead of re-reading the PDF."""
+    result = {"invoice_no": None, "invoice_date": None, "total": None}
+
+    m = re.search(r"#\s*Facture\s*:?\s*(\d{4,8})", text, re.IGNORECASE)
+    if m:
+        result["invoice_no"] = m.group(1)
+
+    m = re.search(r"Date\s*:\s*(\d{4})\.(\d{2})\.(\d{2})", text)
+    if m:
+        y, mo, d = (int(g) for g in m.groups())
+        try:
+            result["invoice_date"] = date(y, mo, d)
+        except ValueError:
+            pass
+
+    m = re.search(r"Total\s+CAD\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if m:
+        result["total"] = float(m.group(1).replace(",", ""))
+
+    return result
+
+
+def _proden_extract_invoice_fields(pdf_bytes: bytes) -> dict:
+    """Single-pass extraction of everything the AP Audit needs from a Proden
+    invoice: invoice number, invoice date, and grand total."""
+    text, ocr_used = _proden_get_text(pdf_bytes)
+    result = _proden_parse_fields_from_text(text)
+    result["ocr_used"] = ocr_used
+    return result
 
 
 def _proden_extract_backup_code(filename: str) -> "str | None":
@@ -1139,6 +1216,33 @@ def calc_due_date(invoice_date) -> "date | None":
     return date(base.year, base.month, 30)
 
 
+def _bourret_due_date(invoice_date) -> "date | None":
+    """
+    Bourret's payment terms are configured in its own vendor profile inside
+    the accounting system (not chosen per invoice, unlike Atlantic's
+    quincena rule above) and always resolve to the 15th of the calendar
+    month right after the invoice date — confirmed against a real posted
+    A/P Voucher Audit Listing (8 distinct invoice dates across 2 months,
+    100% match).
+    """
+    if invoice_date is None:
+        return None
+    y, m = invoice_date.year, invoice_date.month + 1
+    if m > 12:
+        y, m = y + 1, 1
+    return date(y, m, 15)
+
+
+def _proden_due_date(invoice_date) -> "date | None":
+    """Proden's vendor profile uses a plain Net-30 term — due date is
+    exactly 30 calendar days after the invoice date, no rounding. Confirmed
+    against a real posted A/P Voucher Audit Listing (4 invoices, 100% match)
+    — unlike Bourret, whose own profile rounds up to the 15th instead."""
+    if invoice_date is None:
+        return None
+    return invoice_date + timedelta(days=30)
+
+
 def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
     """
     Extract the INVOICE DATE from an Atlantic invoice PDF.
@@ -1320,8 +1424,10 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             mv = re.search(r'(?:^|\s)(\d{1,4})\s+APINV\b', row_tx, re.IGNORECASE)
             voucher_no = mv.group(1) if mv else None
 
-            # Regex on joined row text (works when APINV and number share a band)
-            m = re.search(r'APINV\s+(\d{7,10})\b', row_tx, re.IGNORECASE)
+            # Regex on joined row text (works when APINV and number share a band).
+            # 6 digits covers Proden's invoice numbers (e.g. 308824); 7-10
+            # covers Atlantic's and Bourret's.
+            m = re.search(r'APINV\s+(\d{6,10})\b', row_tx, re.IGNORECASE)
             if m:
                 apinv_rows.append((yk, m.group(1), voucher_no))
                 continue
@@ -1337,7 +1443,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 found = False
                 for ny in nearby:
                     for w in sorted(row_map[ny], key=lambda w: w["x0"]):
-                        if w["x0"] >= apinv_x1 - 5 and re.match(r'^\d{7,10}$', w["text"]):
+                        if w["x0"] >= apinv_x1 - 5 and re.match(r'^\d{6,10}$', w["text"]):
                             apinv_rows.append((yk, w["text"], voucher_no))
                             found = True
                             break
@@ -1354,24 +1460,33 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             block_words = [w for y in block_ys for w in row_map[y]]
             block_text  = " ".join(w["text"] for w in block_words)
 
-            # Vendor: 10 digits starting with 01
+            # Vendor: 10 digits starting with 01 (Atlantic's own vendor id
+            # convention) or 04 (seen on Bourret's AP vendor id) — both are
+            # accepted since the audit now also covers non-Atlantic suppliers.
             vendor = None
-            mv = re.search(r'\b(01\d{8})\b', block_text)
+            mv = re.search(r'\b(0[14]\d{8})\b', block_text)
             if mv:
                 vendor = mv.group(1)
 
-            # GL: 6 digits starting with 3
-            gl = None
-            mg = re.search(r'\b(3\d{5})\b', block_text)
-            if mg:
-                gl = mg.group(1)
-
             # CC: known values only
             cc = None
+            cc_end = 0
             for mc in re.finditer(r'\b([A-Z]{2}\d{2})\b', block_text):
                 if mc.group(1).upper() in known_ccs:
                     cc = mc.group(1).upper()
+                    cc_end = mc.end()
                     break
+
+            # GL: 6 digits starting with 3. Searched only in the text AFTER
+            # the CC match (which always precedes GL in the layout) — some
+            # suppliers' invoice numbers (e.g. Proden's, like 308824) also
+            # happen to be 6 digits starting with 3, and appear earlier in
+            # the block, so searching the whole block can match the invoice
+            # number instead of the real GL.
+            gl = None
+            mg = re.search(r'\b(3\d{5})\b', block_text[cc_end:])
+            if mg:
+                gl = mg.group(1)
 
             # Invoice date: the date printed ON THE SAME LINE as the APINV /
             # invoice-number row (±6 pt — Crystal Reports row tolerance).
@@ -1390,7 +1505,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 below_ys = [y for y in sorted_ys if yk + 6 < y <= block_cap]
                 due_date = _row_date(below_ys)
 
-            # Total: find the 'Total:' label row (not Sub-Total / Sous-Total)
+            # Total: find the 'Total:' label row (not Sub-Total / Sous-Total).
+            # The label and its amount are usually grouped into the same 6pt
+            # row bucket, but a sub-pixel vertical offset between the two
+            # (seen as small as ~2.75pt) can round them into adjacent buckets
+            # — so if the label's own bucket has no amount, widen the search
+            # a little rather than falling through to the next 'Total' match
+            # (which, for the last voucher in a session, can otherwise pick
+            # up the report's own Grand Totals footer instead).
             total_amt = None
             for y in block_ys:
                 row_ws2 = row_map[y]
@@ -1398,13 +1520,17 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 if (re.search(r'\bTOTAL\b', row_tx2)
                         and "SUB" not in row_tx2
                         and "SOUS" not in row_tx2):
-                    for w in row_ws2:
-                        clean = w["text"].replace(",", "")
-                        if re.match(r'^\d+\.\d{2}$', clean):
-                            val = float(clean)
-                            if val >= 10.0:
-                                total_amt = val
-                                break
+                    search_ys = [y] + [ny for ny in sorted_ys if 0 < abs(ny - y) <= 8]
+                    for sy in search_ys:
+                        for w in row_map.get(sy, []):
+                            clean = w["text"].replace(",", "")
+                            if re.match(r'^\d+\.\d{2}$', clean):
+                                val = float(clean)
+                                if val >= 10.0:
+                                    total_amt = val
+                                    break
+                        if total_amt is not None:
+                            break
                     if total_amt is not None:
                         break
 
@@ -3657,6 +3783,49 @@ if active_module == "couru":
             )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ── AP AUDIT — MULTI-SUPPLIER HELPERS ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Atlantic invoices carry their own coding rule (CC/GL derived from the
+# invoice's prefix / product code), so the audit re-derives the "expected"
+# values independently and checks them against what was actually posted.
+# Bourret and Proden don't work that way — their GL/CC is whatever the user
+# picked when running Bourret/Proden Coding, with no independent rule to
+# re-derive it from. The only record of "what was supposed to be coded" is
+# the red stamp already printed on the invoice, so for these two suppliers
+# the audit reads that back instead.
+
+def _detect_invoice_kind(text: str) -> str:
+    """Classify an uploaded invoice's format from its page-1 text so the
+    audit can pick the right field-extraction strategy. Defaults to
+    'atlantic' — the original, still most common, format."""
+    upper = text.upper()
+    if "TRANSPORT BOURRET" in upper:
+        return "bourret"
+    if "PRODEN" in upper:
+        return "proden"
+    return "atlantic"
+
+
+def _parse_coding_stamp(pdf_bytes: bytes) -> dict:
+    """
+    Reads the red coding stamp's VENDOR / CC / GL fields back off an
+    already-coded invoice PDF. Works regardless of which module produced the
+    stamp (Invoice Coding, Bourret Coding, Proden Coding) since they all
+    share the same "VENDOR: x" / "CC: x  |  GL: x" label text.
+    """
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+    result = {"vendor": None, "cc": None, "gl": None}
+    m = re.search(r"VENDOR:\s*(\S+)", text)
+    if m:
+        result["vendor"] = m.group(1)
+    m = re.search(r"CC:\s*(\S+)\s*\|\s*GL:\s*(\S+)", text)
+    if m:
+        result["cc"], result["gl"] = m.group(1), m.group(2)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — AP AUDIT VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3665,7 +3834,13 @@ if active_module == "audit":
     st.markdown(
         "Cross-reference invoice PDFs against the **A/P Voucher Audit Listing** "
         "to verify invoice number, date, payment date, cost centre, vendor, and GL "
-        "before the session is permanently posted."
+        "before the session is permanently posted.\n\n"
+        "Works across suppliers automatically: Atlantic invoices are detected "
+        "and validated against their own coding rules as before; **Bourret** and "
+        "**Proden** invoices are detected too, but since their GL/CC come from what "
+        "you chose in Bourret/Proden Coding rather than the invoice itself, those "
+        "are validated against the coding stamp already printed on the invoice — "
+        "so upload the **already-coded** PDFs for these two suppliers."
     )
 
     col_inv_up, col_rpt_up = st.columns(2)
@@ -3739,27 +3914,73 @@ if active_module == "audit":
                 prog.progress((fi + 1) / len(audit_inv_files), text=f"Processing {f.name}…")
                 raw = f.read()
 
-                inv_data   = extract_invoice_data(raw, f.name)
-                invoice_no = inv_data.get("invoice_no")
-                inv_date   = extract_invoice_date(raw)
-                exp_due    = calc_due_date(inv_date)
+                # Peek at page 1 to classify the invoice format. A short peek
+                # usually means there's no real invoice text on the page —
+                # either it's scanned, or (for an already-coded invoice whose
+                # body has no text layer at all) all pdfplumber found was our
+                # own stamp. Either way, OCR recovers the invoice content the
+                # plain text is missing, so it's tried whenever the peek is
+                # too short to be a real invoice page rather than only when
+                # it's completely empty.
+                with pdfplumber.open(BytesIO(raw)) as _pdf:
+                    peek_text = _pdf.pages[0].extract_text() or ""
+                if len(peek_text.strip()) < 200 and OCR_AVAILABLE:
+                    _img = _splitter_render_page_image(raw, 1, dpi=200)
+                    if _img is not None:
+                        ocr_text = pytesseract.image_to_string(_img)
+                        if len(ocr_text.strip()) > len(peek_text.strip()):
+                            peek_text = ocr_text
+                kind = _detect_invoice_kind(peek_text)
 
-                # Amounts from invoice PDF
-                amts = extract_invoice_amounts(raw)
-                inv_net   = float(amts["net"])   if amts["net"]   else None
-                inv_taxes = amts["taxes"]  # already float or None
-                inv_total = float(amts["total"]) if amts["total"] else None
-                # If total not found, compute it
-                if inv_total is None and inv_net is not None and inv_taxes is not None:
-                    inv_total = round(inv_net + inv_taxes, 2)
+                if kind == "bourret":
+                    # Bourret's GL/CC aren't derived from the invoice itself —
+                    # they're whatever was chosen in Bourret Coding, so the
+                    # "expected" values are read back from that coding stamp.
+                    lines      = [ln.strip() for ln in peek_text.splitlines() if ln.strip()]
+                    invoice_no, _pod = _bourret_extract_ids(lines)
+                    inv_date   = _bourret_extract_invoice_date(lines)
+                    exp_due    = _bourret_due_date(inv_date)
+                    inv_net    = None
+                    inv_taxes  = None
+                    inv_total  = _bourret_extract_total(raw)
+                    stamp      = _parse_coding_stamp(raw)
+                    vendor_ext, cc_ext, gl_ext = stamp["vendor"], stamp["cc"], stamp["gl"]
 
-                cc_prefix = inv_data.get("cc_prefix")
-                if inv_data.get("is_six"):
-                    vendor_ext = VENDOR_EXCEPCION
-                    _, cc_ext  = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
+                elif kind == "proden":
+                    # Same reasoning as Bourret — GL/CC come from Proden Coding,
+                    # not from the invoice, so read them back from the stamp.
+                    fields     = _proden_parse_fields_from_text(peek_text)
+                    invoice_no = fields["invoice_no"]
+                    inv_date   = fields["invoice_date"]
+                    exp_due    = _proden_due_date(inv_date)
+                    inv_net    = None
+                    inv_taxes  = None
+                    inv_total  = fields["total"]
+                    stamp      = _parse_coding_stamp(raw)
+                    vendor_ext, cc_ext, gl_ext = stamp["vendor"], stamp["cc"], stamp["gl"]
+
                 else:
-                    vendor_ext, cc_ext = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
-                gl_ext = get_gl(inv_data.get("product_code"))
+                    inv_data   = extract_invoice_data(raw, f.name)
+                    invoice_no = inv_data.get("invoice_no")
+                    inv_date   = extract_invoice_date(raw)
+                    exp_due    = calc_due_date(inv_date)
+
+                    # Amounts from invoice PDF
+                    amts = extract_invoice_amounts(raw)
+                    inv_net   = float(amts["net"])   if amts["net"]   else None
+                    inv_taxes = amts["taxes"]  # already float or None
+                    inv_total = float(amts["total"]) if amts["total"] else None
+                    # If total not found, compute it
+                    if inv_total is None and inv_net is not None and inv_taxes is not None:
+                        inv_total = round(inv_net + inv_taxes, 2)
+
+                    cc_prefix = inv_data.get("cc_prefix")
+                    if inv_data.get("is_six"):
+                        vendor_ext = VENDOR_EXCEPCION
+                        _, cc_ext  = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
+                    else:
+                        vendor_ext, cc_ext = get_vendor_cc(cc_prefix) if cc_prefix else (None, None)
+                    gl_ext = get_gl(inv_data.get("product_code"))
 
                 audit_rec    = audit_data.get(invoice_no) if invoice_no else None
                 aud          = audit_rec or {}
@@ -3775,6 +3996,7 @@ if active_module == "audit":
 
                 val_results.append({
                     "filename":     f.name,
+                    "kind":         kind,
                     "invoice_no":   invoice_no or "—",
                     "found":        audit_rec is not None,
                     # From invoice PDF
@@ -3874,6 +4096,7 @@ if active_module == "audit":
         for r in val_results:
             export_rows.append({
                 "File":                  r["filename"],
+                "Supplier":              r.get("kind", "atlantic").capitalize(),
                 "Invoice No":            r["invoice_no"],
                 "Found in Audit":        "Yes" if r["found"] else "No",
                 "Voucher No":            r.get("voucher_aud") or "",
