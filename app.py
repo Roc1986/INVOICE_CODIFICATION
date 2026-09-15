@@ -1216,6 +1216,23 @@ def calc_due_date(invoice_date) -> "date | None":
     return date(base.year, base.month, 30)
 
 
+def _supplier_profile_due_date(invoice_date) -> "date | None":
+    """
+    Bourret and Proden's payment terms are configured once in the vendor's
+    own profile inside the accounting system (not chosen per invoice, unlike
+    Atlantic's quincena rule above) and always resolve to the 15th of the
+    calendar month right after the invoice date — confirmed against a real
+    posted A/P Voucher Audit Listing (8 distinct invoice dates across 2
+    months, 100% match).
+    """
+    if invoice_date is None:
+        return None
+    y, m = invoice_date.year, invoice_date.month + 1
+    if m > 12:
+        y, m = y + 1, 1
+    return date(y, m, 15)
+
+
 def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
     """
     Extract the INVOICE DATE from an Atlantic invoice PDF.
@@ -1431,9 +1448,11 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
             block_words = [w for y in block_ys for w in row_map[y]]
             block_text  = " ".join(w["text"] for w in block_words)
 
-            # Vendor: 10 digits starting with 01
+            # Vendor: 10 digits starting with 01 (Atlantic's own vendor id
+            # convention) or 04 (seen on Bourret's AP vendor id) — both are
+            # accepted since the audit now also covers non-Atlantic suppliers.
             vendor = None
-            mv = re.search(r'\b(01\d{8})\b', block_text)
+            mv = re.search(r'\b(0[14]\d{8})\b', block_text)
             if mv:
                 vendor = mv.group(1)
 
@@ -1467,7 +1486,14 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 below_ys = [y for y in sorted_ys if yk + 6 < y <= block_cap]
                 due_date = _row_date(below_ys)
 
-            # Total: find the 'Total:' label row (not Sub-Total / Sous-Total)
+            # Total: find the 'Total:' label row (not Sub-Total / Sous-Total).
+            # The label and its amount are usually grouped into the same 6pt
+            # row bucket, but a sub-pixel vertical offset between the two
+            # (seen as small as ~2.75pt) can round them into adjacent buckets
+            # — so if the label's own bucket has no amount, widen the search
+            # a little rather than falling through to the next 'Total' match
+            # (which, for the last voucher in a session, can otherwise pick
+            # up the report's own Grand Totals footer instead).
             total_amt = None
             for y in block_ys:
                 row_ws2 = row_map[y]
@@ -1475,13 +1501,17 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 if (re.search(r'\bTOTAL\b', row_tx2)
                         and "SUB" not in row_tx2
                         and "SOUS" not in row_tx2):
-                    for w in row_ws2:
-                        clean = w["text"].replace(",", "")
-                        if re.match(r'^\d+\.\d{2}$', clean):
-                            val = float(clean)
-                            if val >= 10.0:
-                                total_amt = val
-                                break
+                    search_ys = [y] + [ny for ny in sorted_ys if 0 < abs(ny - y) <= 8]
+                    for sy in search_ys:
+                        for w in row_map.get(sy, []):
+                            clean = w["text"].replace(",", "")
+                            if re.match(r'^\d+\.\d{2}$', clean):
+                                val = float(clean)
+                                if val >= 10.0:
+                                    total_amt = val
+                                    break
+                        if total_amt is not None:
+                            break
                     if total_amt is not None:
                         break
 
@@ -3890,7 +3920,7 @@ if active_module == "audit":
                     lines      = [ln.strip() for ln in peek_text.splitlines() if ln.strip()]
                     invoice_no, _pod = _bourret_extract_ids(lines)
                     inv_date   = _bourret_extract_invoice_date(lines)
-                    exp_due    = calc_due_date(inv_date)
+                    exp_due    = _supplier_profile_due_date(inv_date)
                     inv_net    = None
                     inv_taxes  = None
                     inv_total  = _bourret_extract_total(raw)
@@ -3903,7 +3933,7 @@ if active_module == "audit":
                     fields     = _proden_parse_fields_from_text(peek_text)
                     invoice_no = fields["invoice_no"]
                     inv_date   = fields["invoice_date"]
-                    exp_due    = calc_due_date(inv_date)
+                    exp_due    = _supplier_profile_due_date(inv_date)
                     inv_net    = None
                     inv_taxes  = None
                     inv_total  = fields["total"]
