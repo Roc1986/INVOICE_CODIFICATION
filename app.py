@@ -823,6 +823,25 @@ def process_one(original_bytes, user, vendor, cc, gl, coding_date, geometry=None
     return stamp_pdf(original_bytes, stamp_bytes)
 
 
+def _already_coded(pdf_bytes: bytes) -> bool:
+    """
+    True if page 1 already carries a coding stamp ('POSTED BY:', common to
+    every stamp format/module). Re-stamping a file that's already coded
+    draws a new stamp box directly on top of the old one without removing
+    its underlying text — the box only visually covers it, so both sets of
+    text remain in the PDF, spatially overlapping closely enough that text
+    extraction (e.g. the AP Audit reading a stamp back) can interleave them
+    character-by-character into garbage. Checked so Bourret/Proden Coding
+    can skip a file instead of corrupting it this way.
+    """
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ""
+    except Exception:
+        return False
+    return "POSTED BY:" in text
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ── PRODEN CODING FUNCTIONS ───────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3484,6 +3503,10 @@ if active_module == "bourretcoding":
                 cc = exception_cc.get(f.name, batch_cc)
                 try:
                     raw = raw_bytes_map[f.name]
+                    if _already_coded(raw):
+                        errors.append(f"{f.name}: already has a coding stamp — skipped to avoid "
+                                      f"double-stamping (re-upload the original, uncoded invoice)")
+                        continue
                     stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date,
                                            geometry=BOURRET_STAMP_GEOMETRY)
                     item = {
@@ -3622,6 +3645,10 @@ if active_module == "prodencoding":
                 progress.progress((idx + 1) / len(prodencoding_uploads), text=f"Coding {f.name}…")
                 try:
                     raw = raw_bytes_map[f.name]
+                    if _already_coded(raw):
+                        errors.append(f"{f.name}: already has a coding stamp — skipped to avoid "
+                                      f"double-stamping (re-upload the original, uncoded invoice)")
+                        continue
                     subtotal, subtotal_via_ocr = _proden_extract_subtotal(raw)
                     amount_str = f"${subtotal:.0f}" if subtotal is not None else "??"
                     if subtotal is None:
@@ -3927,8 +3954,12 @@ if active_module == "audit":
                     return a == b
                 return str(a).strip().upper() == str(b).strip().upper()
 
-            def _cmp_amt(a, b, tol=0.05):
-                """Compare two floats with tolerance; None on either side → None."""
+            def _cmp_amt(a, b, tol=0.005):
+                """Compare two floats with tolerance; None on either side → None.
+                Amounts should match to the cent — a real 1-cent discrepancy
+                (rounding, a manual correction at posting time, etc.) is
+                exactly what this check is meant to catch, so the tolerance
+                only absorbs floating-point noise, not real differences."""
                 if a is None or b is None:
                     return None
                 try:
