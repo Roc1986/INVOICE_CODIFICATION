@@ -91,6 +91,12 @@ DEFAULT_GL_CODES = [
 DEFAULT_USERS = ["ROC", "MLE", "PD"]
 VENDOR_EXCEPCION = "0101000390"
 
+# Transport Bourret always codes to the same AP vendor — only GL / CC vary,
+# and only for the occasional exception invoice.
+BOURRET_VENDOR     = "0402000870"
+BOURRET_GL_OPTIONS = ["315001", "975001"]
+BOURRET_CC_OPTIONS = ["EV01", "ML01", "MV01"]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2151,6 +2157,7 @@ MODULES = [
     {"key": "bourret",  "icon": "🚛", "label": "Bourret Splitter",  "desc": "Split Transport Bourret AP batches by Invoice + POD."},
     {"key": "matcher",  "icon": "🔗", "label": "Invoice Matcher",   "desc": "Match invoices with POs and merge into one PDF."},
     {"key": "coding",   "icon": "🏷️",  "label": "Invoice Coding",    "desc": "Stamp GL / Cost Centre codes on invoices."},
+    {"key": "bourretcoding", "icon": "🧾", "label": "Bourret Coding", "desc": "Bulk-code Transport Bourret invoices (fixed vendor, choose GL & CC)."},
     {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
     {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
     {"key": "recon",    "icon": "🧮", "label": "Statement Reconciliation", "desc": "Reconcile Atlantic's statement against the system and invoice copies."},
@@ -3144,6 +3151,148 @@ if active_module == "coding":
             for i in sorted(to_delete, reverse=True):
                 st.session_state.processed.pop(i)
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3B — BOURRET CODING
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "bourretcoding":
+    st.subheader("🧾 Bourret Invoice Coding")
+    st.markdown(
+        f"Upload Transport Bourret invoices (from the **Bourret Splitter**, or any single "
+        f"invoice PDF). Vendor is always **`{BOURRET_VENDOR}`** for this carrier — pick the "
+        f"**GL** and **Cost Centre** to apply to the whole batch below, then override any "
+        f"individual invoice that's an exception."
+    )
+
+    if "bourretcoding_upload_key" not in st.session_state:
+        st.session_state.bourretcoding_upload_key = 0
+
+    col_gl, col_cc = st.columns(2)
+    with col_gl:
+        batch_gl = st.selectbox("GL (applies to all, unless overridden below)",
+                                 BOURRET_GL_OPTIONS, key="bourretcoding_batch_gl")
+    with col_cc:
+        batch_cc = st.selectbox("Cost Centre (applies to all, unless overridden below)",
+                                 BOURRET_CC_OPTIONS, key="bourretcoding_batch_cc")
+
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        bourretcoding_uploads = st.file_uploader(
+            "Drag or select one or more Bourret invoice PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"bourretcoding_uploader_{st.session_state.bourretcoding_upload_key}",
+        )
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="bourretcoding_clear"):
+            st.session_state.bourretcoding_upload_key += 1
+            st.rerun()
+
+    if bourretcoding_uploads:
+        st.divider()
+
+        # Cache raw bytes by upload signature so re-reading only happens
+        # when the file set actually changes, not on every widget rerun.
+        _sig = tuple((f.name, f.size) for f in bourretcoding_uploads)
+        if _sig != st.session_state.get("_bourretcoding_sig"):
+            st.session_state["_bourretcoding_raw"] = {
+                idx: f.read() for idx, f in enumerate(bourretcoding_uploads)
+            }
+            st.session_state["_bourretcoding_sig"] = _sig
+        raw_bytes_map = st.session_state["_bourretcoding_raw"]
+
+        resolved_gl = {}
+        resolved_cc = {}
+        for idx, f in enumerate(bourretcoding_uploads):
+            with st.expander(f"📄 {f.name}", expanded=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    sel_gl = st.selectbox(
+                        "GL", BOURRET_GL_OPTIONS,
+                        index=BOURRET_GL_OPTIONS.index(batch_gl),
+                        key=f"bourretcoding_gl_{idx}",
+                    )
+                with c2:
+                    sel_cc = st.selectbox(
+                        "Cost Centre", BOURRET_CC_OPTIONS,
+                        index=BOURRET_CC_OPTIONS.index(batch_cc),
+                        key=f"bourretcoding_cc_{idx}",
+                    )
+                resolved_gl[idx] = sel_gl
+                resolved_cc[idx] = sel_cc
+
+                usr_prev  = current_user or "???"
+                date_prev = coding_date.strftime("%d/%m/%Y")
+                st.markdown(f"""
+                <div style='margin-top:10px'>
+                <p style='margin-bottom:4px; color:gray; font-size:12px'>👁️ Stamp preview:</p>
+                <div class='stamp-preview'>
+                POSTED BY: {usr_prev}<br>
+                VENDOR: {BOURRET_VENDOR}<br>
+                CC: {sel_cc}&nbsp;&nbsp;|&nbsp;&nbsp;GL: {sel_gl}<br>
+                DATE: {date_prev}
+                </div></div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            do_process_bourret = st.button(
+                "🚀 Code Invoices",
+                type="primary",
+                use_container_width=True,
+                disabled=not bool(current_user),
+                key="bourretcoding_process_btn",
+            )
+        with col_info:
+            if not current_user:
+                st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
+
+        if do_process_bourret and current_user:
+            progress = st.progress(0, text="Starting…")
+            errors = []
+            for idx, f in enumerate(bourretcoding_uploads):
+                progress.progress((idx + 1) / len(bourretcoding_uploads), text=f"Coding {f.name}…")
+                gl = resolved_gl.get(idx, batch_gl)
+                cc = resolved_cc.get(idx, batch_cc)
+                try:
+                    raw = raw_bytes_map[idx]
+                    stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date)
+                    st.session_state.processed.append({
+                        "filename":       f.name,
+                        "original_bytes": raw,
+                        "pdf_bytes":      stamped,
+                        "invoice_no":     None,
+                        "vendor":         BOURRET_VENDOR,
+                        "cc":             cc,
+                        "gl":             gl,
+                        "user":           current_user,
+                        "date":           coding_date.strftime("%d/%m/%Y"),
+                        "date_obj":       coding_date,
+                        "ts":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    })
+                except Exception as e:
+                    errors.append(f"{f.name}: {e}")
+            progress.progress(1.0, text="✅ Done")
+            if errors:
+                for err in errors:
+                    st.error(err)
+            else:
+                st.success(f"🎉 **{len(bourretcoding_uploads)} invoice(s)** coded successfully.")
+                st.balloons()
+
+    elif not bourretcoding_uploads:
+        st.session_state.pop("_bourretcoding_sig", None)
+        st.info("📂 Upload Transport Bourret invoices to get started.")
+
+    if st.session_state.processed:
+        st.divider()
+        st.caption(
+            f"📋 {len(st.session_state.processed)} coded invoice(s) so far — see the "
+            f"**Invoice Coding** tab or the sidebar ZIP download for the full results list."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
