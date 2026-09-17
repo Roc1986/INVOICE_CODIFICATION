@@ -2543,6 +2543,7 @@ with st.sidebar:
         )
         if st.button("🗑️ Clear all results", use_container_width=True, type="secondary"):
             st.session_state.processed = []
+            st.session_state.coding_dl_selected = None
             st.rerun()
 
     st.divider()
@@ -3205,6 +3206,7 @@ if active_module == "coding":
         if st.button("🗑️ Clear\nall", use_container_width=True,
                      help="Clear uploaded files AND all coded results"):
             st.session_state.processed    = []
+            st.session_state.coding_dl_selected = None
             st.session_state.upload_key  += 1
             st.rerun()
 
@@ -3403,6 +3405,7 @@ if active_module == "coding":
     # ── Results section (always visible when there are coded invoices) ────────
     if st.session_state.processed:
         n = len(st.session_state.processed)
+        st.session_state.setdefault("coding_dl_selected", None)
         st.divider()
         col_hdr, col_zip, col_del = st.columns([3, 2, 1])
         with col_hdr:
@@ -3420,7 +3423,21 @@ if active_module == "coding":
         with col_del:
             if st.button("🗑️ Delete all", use_container_width=True):
                 st.session_state.processed = []
+                st.session_state.coding_dl_selected = None
                 st.rerun()
+
+        sel = st.session_state.coding_dl_selected
+        if sel is not None and sel < len(st.session_state.processed):
+            item = st.session_state.processed[sel]
+            st.success(f"✅ Ready: **{item['filename']}**")
+            st.download_button(
+                f"⬇️ Download {item['filename']}",
+                data=item["pdf_bytes"],
+                file_name=item["filename"],
+                mime="application/pdf",
+                key="coding_dl_ready",
+                type="primary",
+            )
 
         with st.expander("📅 Modify Coding Date"):
             st.caption("Use this if the invoice could not be registered on the same day it was coded.")
@@ -3462,14 +3479,12 @@ if active_module == "coding":
                     f"Date: `{item['date']}` | Coded: {item['ts']}"
                 )
             with col2:
-                st.download_button(
-                    "⬇️ Download",
-                    data=item["pdf_bytes"],
-                    file_name=item["filename"],
-                    mime="application/pdf",
-                    key=f"dl_{i}",
-                    use_container_width=True,
-                )
+                if st.button("📥 Prepare download", key=f"dl_{i}", use_container_width=True,
+                             help="Loads only this file for download, instead of every "
+                                  "file in the list at once — avoids the browser stalling "
+                                  "on large batches."):
+                    st.session_state.coding_dl_selected = i
+                    st.rerun()
             with col3:
                 if st.button("🗑️", key=f"del_{i}", help="Remove from list"):
                     to_delete.append(i)
@@ -3480,6 +3495,7 @@ if active_module == "coding":
         if to_delete:
             for i in sorted(to_delete, reverse=True):
                 st.session_state.processed.pop(i)
+            st.session_state.coding_dl_selected = None
             st.rerun()
 
 
