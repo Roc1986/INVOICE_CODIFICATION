@@ -267,6 +267,30 @@ def _splitter_render_page_image(pdf_bytes: bytes, page_no: int, dpi: int = 200):
     return images[0] if images else None
 
 
+def _shrink_split_pdf(pdf_bytes: bytes) -> bytes:
+    """
+    Drop resources (images, fonts, …) a split-out invoice doesn't actually
+    use. When a batch PDF defines /Resources once at a shared ancestor of
+    the page tree (common for machine-generated batches), pypdf's per-page
+    extraction inherits and clones that WHOLE shared dict into every single
+    split file — so a 10-invoice, 230 KB batch can split into ten ~220 KB
+    files (each carrying the other nine invoices' images/fonts too) instead
+    of ten ~23 KB files. pikepdf's remove_unreferenced_resources() prunes
+    exactly the objects the retained page doesn't reference. Falls back to
+    the unpruned bytes when pikepdf isn't installed.
+    """
+    if not PIKEPDF_AVAILABLE:
+        return pdf_bytes
+    try:
+        with pikepdf.open(BytesIO(pdf_bytes)) as pdf:
+            pdf.remove_unreferenced_resources()
+            out = BytesIO()
+            pdf.save(out)
+            return out.getvalue()
+    except Exception:
+        return pdf_bytes
+
+
 def _splitter_suggest_rotation(pdf_bytes: bytes, sample_pages: int = 3) -> int:
     """
     Best-effort guess at the page rotation needed for a scanned batch —
@@ -390,6 +414,7 @@ def split_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callback=None)
             writer.add_page(page)
         buf = BytesIO()
         writer.write(buf)
+        split_bytes = _shrink_split_pdf(buf.getvalue())
 
         inv_no = inv["number"]
         cc     = _splitter_get_cc(inv["cc_raw"]) if inv["cc_raw"] else "??"
@@ -404,7 +429,7 @@ def split_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callback=None)
 
         results.append({
             "filename":     f"{inv_no} {cc} {bol}.pdf",
-            "pdf_bytes":    buf.getvalue(),
+            "pdf_bytes":    split_bytes,
             "invoice_no":   inv_no,
             "cc":           cc,
             "bol":          bol,
@@ -593,6 +618,7 @@ def split_bourret_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callba
             writer.add_page(page)
         buf = BytesIO()
         writer.write(buf)
+        split_bytes = _shrink_split_pdf(buf.getvalue())
 
         invoice_no = inv["invoice_no"]
         pod_no     = inv["pod_no"] or "??"
@@ -604,7 +630,7 @@ def split_bourret_batch_pdf(pdf_bytes: bytes, rotation: int = 0, progress_callba
 
         results.append({
             "filename":     f"{invoice_no} EV {pod_no}.pdf",
-            "pdf_bytes":    buf.getvalue(),
+            "pdf_bytes":    split_bytes,
             "invoice_no":   invoice_no,
             "pod_no":       pod_no,
             "source_pages": [p + 1 for p in inv["pages"]],
