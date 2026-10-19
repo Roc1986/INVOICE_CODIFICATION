@@ -3512,21 +3512,14 @@ if active_module == "bourretcoding":
     st.subheader("🧾 Bourret Invoice Coding")
     st.markdown(
         f"Upload Transport Bourret invoices (from the **Bourret Splitter**, or any single "
-        f"invoice PDF). Vendor is always **`{BOURRET_VENDOR}`** for this carrier — pick the "
-        f"**GL** and **Cost Centre** to apply to the whole batch and code them all at once. "
-        f"Invoices totalling exactly **${BOURRET_FIXED_TOTAL:.2f}** are coded automatically to "
-        f"GL `{BOURRET_FIXED_TOTAL_GL}` / CC `{BOURRET_FIXED_TOTAL_CC}`, regardless of the "
-        f"batch selection below — a per-file exception still overrides this."
+        f"invoice PDF). Vendor is always **`{BOURRET_VENDOR}`** for this carrier. Invoices "
+        f"totalling exactly **${BOURRET_FIXED_TOTAL:.2f}** are coded automatically to "
+        f"GL `{BOURRET_FIXED_TOTAL_GL}` / CC `{BOURRET_FIXED_TOTAL_CC}` — every other total "
+        f"needs its GL and Cost Centre confirmed individually below before coding."
     )
 
     if "bourretcoding_upload_key" not in st.session_state:
         st.session_state.bourretcoding_upload_key = 0
-
-    col_gl, col_cc = st.columns(2)
-    with col_gl:
-        batch_gl = st.selectbox("GL", BOURRET_GL_OPTIONS, key="bourretcoding_batch_gl")
-    with col_cc:
-        batch_cc = st.selectbox("Cost Centre", BOURRET_CC_OPTIONS, key="bourretcoding_batch_cc")
 
     col_up, col_clear = st.columns([5, 1])
     with col_up:
@@ -3540,81 +3533,130 @@ if active_module == "bourretcoding":
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear", use_container_width=True, key="bourretcoding_clear"):
             st.session_state.bourretcoding_upload_key += 1
-            st.session_state.pop("_bourretcoding_sig", None)
+            st.session_state.pop("_bourretcoding_ui_sig", None)
+            st.session_state.pop("_bourretcoding_ui_cache", None)
             st.session_state.pop("bourretcoding_last_batch", None)
             st.rerun()
 
-    exception_gl = {}
-    exception_cc = {}
+    if not bourretcoding_uploads:
+        st.session_state.pop("_bourretcoding_ui_sig", None)
+        st.session_state.pop("_bourretcoding_ui_cache", None)
+        st.info("📂 Upload Transport Bourret invoices to get started.")
+    else:
+        # Re-parse PDFs only when the uploaded file set actually changes,
+        # not on every widget rerun — same pattern as Atlantic Coding.
+        _bsig = tuple((f.name, f.size) for f in bourretcoding_uploads)
+        if _bsig != st.session_state.get("_bourretcoding_ui_sig"):
+            _bui = []
+            for f in bourretcoding_uploads:
+                raw = f.read()
+                item = {"filename": f.name, "raw_bytes": raw}
+                if _already_coded(raw):
+                    item["error"] = ("already has a coding stamp — skip and re-upload "
+                                      "the original, uncoded invoice")
+                else:
+                    total = _bourret_extract_total(raw)
+                    item["total"] = total
+                    if total is not None and abs(total - BOURRET_FIXED_TOTAL) < 0.005:
+                        item["gl_auto"] = BOURRET_FIXED_TOTAL_GL
+                        item["cc_auto"] = BOURRET_FIXED_TOTAL_CC
+                    else:
+                        item["gl_auto"] = None
+                        item["cc_auto"] = None
+                _bui.append(item)
+            st.session_state["_bourretcoding_ui_cache"] = _bui
+            st.session_state["_bourretcoding_ui_sig"]   = _bsig
+        bourretcoding_ui = st.session_state["_bourretcoding_ui_cache"]
 
-    if bourretcoding_uploads:
-        with st.expander(f"⚙️ Exceptions — override GL/CC for specific invoices "
-                          f"({len(bourretcoding_uploads)} loaded)"):
-            fname_list = [f.name for f in bourretcoding_uploads]
-            exception_files = st.multiselect(
-                "Invoice(s) that need a different GL/CC than the batch default above:",
-                fname_list, key="bourretcoding_exception_files",
+        resolved_gl = {}
+        resolved_cc = {}
+
+        n_err  = sum(1 for inv in bourretcoding_ui if inv.get("error"))
+        n_auto = sum(1 for inv in bourretcoding_ui
+                     if not inv.get("error") and inv.get("gl_auto") and inv.get("cc_auto"))
+        n_review = len(bourretcoding_ui) - n_err - n_auto
+
+        if n_auto:
+            st.success(f"✅ {n_auto} invoice(s) at ${BOURRET_FIXED_TOTAL:.2f} — "
+                       f"auto-coded to GL {BOURRET_FIXED_TOTAL_GL} / CC {BOURRET_FIXED_TOTAL_CC}.")
+        if n_review:
+            st.warning(f"⚠️ {n_review} invoice(s) need GL/CC confirmed manually — review below.")
+        if n_err:
+            st.error(f"❌ {n_err} invoice(s) already coded — skipped, see below.")
+
+        for idx, inv in enumerate(bourretcoding_ui):
+            if inv.get("error"):
+                with st.expander(f"❌  {inv['filename']}", expanded=True):
+                    st.error(inv["error"])
+                continue
+
+            auto_coded = bool(inv.get("gl_auto") and inv.get("cc_auto"))
+            if auto_coded:
+                resolved_gl[idx] = inv["gl_auto"]
+                resolved_cc[idx] = inv["cc_auto"]
+                continue
+
+            with st.expander(f"⚠️  {inv['filename']}", expanded=True):
+                c1, c2, c3 = st.columns([1, 1, 1])
+                with c1:
+                    total_str = f"${inv['total']:.2f}" if inv.get("total") is not None else "— (not detected)"
+                    st.markdown("**💲 Total**")
+                    st.write(f"`{total_str}`")
+                with c2:
+                    st.markdown("**📊 GL**")
+                    sel_gl = st.selectbox("GL:", BOURRET_GL_OPTIONS, key=f"bourret_gl_{idx}",
+                                           label_visibility="collapsed")
+                    resolved_gl[idx] = sel_gl
+                with c3:
+                    st.markdown("**🏷️ Cost Centre**")
+                    sel_cc = st.selectbox("CC:", BOURRET_CC_OPTIONS, key=f"bourret_cc_{idx}",
+                                           label_visibility="collapsed")
+                    resolved_cc[idx] = sel_cc
+
+                usr_prev  = current_user or "???"
+                date_prev = coding_date.strftime("%d/%m/%Y")
+                st.markdown(f"""
+                <div style='margin-top:10px'>
+                <p style='margin-bottom:4px; color:gray; font-size:12px'>👁️ Stamp preview:</p>
+                <div class='stamp-preview'>
+                POSTED BY: {usr_prev}<br>
+                VENDOR: {BOURRET_VENDOR}<br>
+                CC: {resolved_cc[idx]}&nbsp;&nbsp;|&nbsp;&nbsp;GL: {resolved_gl[idx]}<br>
+                DATE: {date_prev}
+                </div></div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            do_process_bourret = st.button(
+                "🚀 Code Invoices",
+                type="primary",
+                use_container_width=True,
+                disabled=not bool(current_user),
+                key="bourretcoding_process_btn",
             )
-            if exception_files:
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    exc_gl = st.selectbox("GL for selected exceptions", BOURRET_GL_OPTIONS,
-                                           key="bourretcoding_exc_gl")
-                with ec2:
-                    exc_cc = st.selectbox("Cost Centre for selected exceptions", BOURRET_CC_OPTIONS,
-                                           key="bourretcoding_exc_cc")
-                for fname in exception_files:
-                    exception_gl[fname] = exc_gl
-                    exception_cc[fname] = exc_cc
-
-        do_process_bourret = st.button(
-            "🚀 Code Invoices",
-            type="primary",
-            use_container_width=True,
-            disabled=not bool(current_user),
-            key="bourretcoding_process_btn",
-        )
-        if not current_user:
-            st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
+        with col_info:
+            if not current_user:
+                st.warning("⚠️ Select a responsible user (Posted By) in the sidebar before processing.")
 
         if do_process_bourret and current_user:
-            # Cache raw bytes by upload signature so re-reading only happens
-            # when the file set actually changes, not on every widget rerun.
-            _sig = tuple((f.name, f.size) for f in bourretcoding_uploads)
-            if _sig != st.session_state.get("_bourretcoding_sig"):
-                st.session_state["_bourretcoding_raw"] = {
-                    f.name: f.read() for f in bourretcoding_uploads
-                }
-                st.session_state["_bourretcoding_sig"] = _sig
-            raw_bytes_map = st.session_state["_bourretcoding_raw"]
-
             progress = st.progress(0, text="Starting…")
             errors = []
             newly_coded = []
-            for idx, f in enumerate(bourretcoding_uploads):
-                progress.progress((idx + 1) / len(bourretcoding_uploads), text=f"Coding {f.name}…")
+            for idx, inv in enumerate(bourretcoding_ui):
+                if inv.get("error"):
+                    errors.append(f"{inv['filename']}: {inv['error']}")
+                    continue
+                progress.progress((idx + 1) / len(bourretcoding_ui), text=f"Coding {inv['filename']}…")
+                gl = resolved_gl.get(idx, "???")
+                cc = resolved_cc.get(idx, "???")
                 try:
-                    raw = raw_bytes_map[f.name]
-                    if _already_coded(raw):
-                        errors.append(f"{f.name}: already has a coding stamp — skipped to avoid "
-                                      f"double-stamping (re-upload the original, uncoded invoice)")
-                        continue
-                    if f.name in exception_gl:
-                        gl = exception_gl[f.name]
-                        cc = exception_cc[f.name]
-                    else:
-                        inv_total = _bourret_extract_total(raw)
-                        if inv_total is not None and abs(inv_total - BOURRET_FIXED_TOTAL) < 0.005:
-                            gl = BOURRET_FIXED_TOTAL_GL
-                            cc = BOURRET_FIXED_TOTAL_CC
-                        else:
-                            gl = batch_gl
-                            cc = batch_cc
-                    stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date,
-                                           geometry=BOURRET_STAMP_GEOMETRY)
+                    stamped = process_one(inv["raw_bytes"], current_user, BOURRET_VENDOR, cc, gl,
+                                           coding_date, geometry=BOURRET_STAMP_GEOMETRY)
                     item = {
-                        "filename":       f.name,
-                        "original_bytes": raw,
+                        "filename":       inv["filename"],
+                        "original_bytes": inv["raw_bytes"],
                         "pdf_bytes":      stamped,
                         "invoice_no":     None,
                         "vendor":         BOURRET_VENDOR,
@@ -3628,7 +3670,7 @@ if active_module == "bourretcoding":
                     st.session_state.processed.append(item)
                     newly_coded.append(item)
                 except Exception as e:
-                    errors.append(f"{f.name}: {e}")
+                    errors.append(f"{inv['filename']}: {e}")
             progress.progress(1.0, text="✅ Done")
             st.session_state["bourretcoding_last_batch"] = newly_coded
             if errors:
@@ -3637,10 +3679,6 @@ if active_module == "bourretcoding":
             if newly_coded:
                 st.success(f"🎉 **{len(newly_coded)} invoice(s)** coded successfully.")
                 st.balloons()
-
-    else:
-        st.session_state.pop("_bourretcoding_sig", None)
-        st.info("📂 Upload Transport Bourret invoices to get started.")
 
     # ── Results / download section for the most recently coded batch ──────────
     last_batch = st.session_state.get("bourretcoding_last_batch")
