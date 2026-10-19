@@ -102,6 +102,12 @@ VENDOR_EXCEPCION = "0101000390"
 BOURRET_VENDOR     = "0402000870"
 BOURRET_GL_OPTIONS = ["315001", "975001"]
 BOURRET_CC_OPTIONS = ["EV01", "ML01", "MV01"]
+# Invoices totalling exactly this amount always code the same way — applied
+# automatically, no manual GL/CC selection needed. Any other total still
+# needs the batch GL/CC (or a per-file exception) confirmed as before.
+BOURRET_FIXED_TOTAL    = 166.71
+BOURRET_FIXED_TOTAL_GL = "315001"
+BOURRET_FIXED_TOTAL_CC = "EV01"
 # (x, y-top measured from the page bottom, width, height) — positioned in the
 # blank area below the invoice's totals block, matching where the user marked
 # it on their sample invoice so the stamp never covers the freight details.
@@ -3507,7 +3513,10 @@ if active_module == "bourretcoding":
     st.markdown(
         f"Upload Transport Bourret invoices (from the **Bourret Splitter**, or any single "
         f"invoice PDF). Vendor is always **`{BOURRET_VENDOR}`** for this carrier — pick the "
-        f"**GL** and **Cost Centre** to apply to the whole batch and code them all at once."
+        f"**GL** and **Cost Centre** to apply to the whole batch and code them all at once. "
+        f"Invoices totalling exactly **${BOURRET_FIXED_TOTAL:.2f}** are coded automatically to "
+        f"GL `{BOURRET_FIXED_TOTAL_GL}` / CC `{BOURRET_FIXED_TOTAL_CC}`, regardless of the "
+        f"batch selection below — a per-file exception still overrides this."
     )
 
     if "bourretcoding_upload_key" not in st.session_state:
@@ -3584,14 +3593,23 @@ if active_module == "bourretcoding":
             newly_coded = []
             for idx, f in enumerate(bourretcoding_uploads):
                 progress.progress((idx + 1) / len(bourretcoding_uploads), text=f"Coding {f.name}…")
-                gl = exception_gl.get(f.name, batch_gl)
-                cc = exception_cc.get(f.name, batch_cc)
                 try:
                     raw = raw_bytes_map[f.name]
                     if _already_coded(raw):
                         errors.append(f"{f.name}: already has a coding stamp — skipped to avoid "
                                       f"double-stamping (re-upload the original, uncoded invoice)")
                         continue
+                    if f.name in exception_gl:
+                        gl = exception_gl[f.name]
+                        cc = exception_cc[f.name]
+                    else:
+                        inv_total = _bourret_extract_total(raw)
+                        if inv_total is not None and abs(inv_total - BOURRET_FIXED_TOTAL) < 0.005:
+                            gl = BOURRET_FIXED_TOTAL_GL
+                            cc = BOURRET_FIXED_TOTAL_CC
+                        else:
+                            gl = batch_gl
+                            cc = batch_cc
                     stamped = process_one(raw, current_user, BOURRET_VENDOR, cc, gl, coding_date,
                                            geometry=BOURRET_STAMP_GEOMETRY)
                     item = {
