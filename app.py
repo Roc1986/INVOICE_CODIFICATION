@@ -4076,6 +4076,7 @@ if active_module == "audit":
         if st.button("🗑️ Clear results", use_container_width=True, key="audit_clear"):
             st.session_state["audit_results"]    = None
             st.session_state["audit_data_count"] = 0
+            st.session_state["audit_unmatched"]  = None
             st.rerun()
 
     if run_audit and audit_inv_files and audit_report_file:
@@ -4109,6 +4110,7 @@ if active_module == "audit":
                     return None
 
             val_results = []
+            matched_invoice_nos = set()
             prog = st.progress(0, text="Validating invoices…")
             for fi, f in enumerate(audit_inv_files):
                 prog.progress((fi + 1) / len(audit_inv_files), text=f"Processing {f.name}…")
@@ -4181,6 +4183,8 @@ if active_module == "audit":
                     gl_ext = get_gl(inv_data.get("product_code"))
 
                 audit_rec    = audit_data.get(invoice_no) if invoice_no else None
+                if audit_rec is not None:
+                    matched_invoice_nos.add(invoice_no)
                 aud          = audit_rec or {}
                 voucher_aud  = aud.get("voucher")
                 inv_date_aud = aud.get("invoice_date")
@@ -4225,6 +4229,15 @@ if active_module == "audit":
 
             prog.progress(1.0, text="✅ Validation complete")
             st.session_state["audit_results"] = val_results
+            # Audit-report records no uploaded invoice ever matched — these are
+            # registered in the system but couldn't be checked against a PDF
+            # at all (as opposed to a row above, which did have a PDF but
+            # failed one of the field comparisons).
+            st.session_state["audit_unmatched"] = [
+                {"invoice_no": inv_no, **rec}
+                for inv_no, rec in audit_data.items()
+                if inv_no not in matched_invoice_nos
+            ]
             st.rerun()
 
     # ── Results ────────────────────────────────────────────────────────────────
@@ -4251,11 +4264,13 @@ if active_module == "audit":
             if r["found"] and all(v is not False for v in [r[k] for k in _all_flags])
         )
         n_issues = len(val_results) - n_all_ok
+        audit_unmatched = st.session_state.get("audit_unmatched") or []
+        n_unmatched = len(audit_unmatched)
 
         st.info(f"Audit report: **{audit_count}** record(s) parsed")
         st.markdown("<br>", unsafe_allow_html=True)
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             st.markdown(
                 f"<div class='stat-box'><div class='stat-num blue'>{len(val_results)}</div>"
@@ -4282,17 +4297,30 @@ if active_module == "audit":
                 f"<div class='stat-lbl'>Need review</div></div>",
                 unsafe_allow_html=True,
             )
+        with c5:
+            col_c = "amber" if n_unmatched else "green"
+            st.markdown(
+                f"<div class='stat-box'><div class='stat-num {col_c}'>{n_unmatched}</div>"
+                f"<div class='stat-lbl'>In system, no PDF</div></div>",
+                unsafe_allow_html=True,
+            )
 
-        if n_issues == 0:
-            st.success("✅ All invoices passed validation.")
+        if n_issues == 0 and n_unmatched == 0:
+            st.success("✅ All invoices passed validation, and every audit-report record was "
+                       "matched to a PDF.")
         else:
-            st.warning(f"⚠️ {n_issues} invoice(s) need review — see the Excel report below.")
+            msg = f"⚠️ {n_issues} invoice(s) need review" if n_issues else "⚠️ All uploaded invoices passed validation"
+            if n_unmatched:
+                msg += f", and {n_unmatched} audit-report record(s) have no matching PDF (second Excel sheet)"
+            st.warning(msg + ".")
 
         # ── Export to Excel ────────────────────────────────────────────────────
         st.divider()
         export_rows = []
         for r in val_results:
+            needs_review = not (r["found"] and all(r[k] is not False for k in _all_flags))
             export_rows.append({
+                "Validate":              "Yes" if needs_review else "No",
                 "File":                  r["filename"],
                 "Supplier":              r.get("kind", "atlantic").capitalize(),
                 "Invoice No":            r["invoice_no"],
@@ -4320,9 +4348,32 @@ if active_module == "audit":
                 "Total OK":             _icon(r["total_ok"]),
             })
         df_exp = pd.DataFrame(export_rows)
+
+        # Audit-report records that never matched any uploaded PDF — still
+        # registered in the system, just not checkable from this batch.
+        unmatched_rows = [
+            {
+                "Invoice No":   rec.get("invoice_no") or "",
+                "Voucher No":   rec.get("voucher") or "",
+                "Invoice Date": _fmt_date(rec.get("invoice_date")),
+                "Payment Date": _fmt_date(rec.get("due_date")),
+                "CC":           rec.get("cc") or "",
+                "Vendor":       rec.get("vendor") or "",
+                "GL":           rec.get("gl") or "",
+                "Total":        _fmt_amt(rec.get("total")),
+                "Status":       "In system — no PDF attached, not validated",
+            }
+            for rec in audit_unmatched
+        ]
+        df_unmatched = pd.DataFrame(unmatched_rows, columns=[
+            "Invoice No", "Voucher No", "Invoice Date", "Payment Date",
+            "CC", "Vendor", "GL", "Total", "Status",
+        ])
+
         buf_xl = BytesIO()
         with pd.ExcelWriter(buf_xl, engine="openpyxl") as xl_writer:
-            df_exp.to_excel(xl_writer, index=False)
+            df_exp.to_excel(xl_writer, index=False, sheet_name="Validation")
+            df_unmatched.to_excel(xl_writer, index=False, sheet_name="In System - No PDF")
         buf_xl.seek(0)
         st.download_button(
             "⬇️ Download Validation Report (Excel)",
