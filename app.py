@@ -240,7 +240,7 @@ def _splitter_extract_bol(lines: list) -> str | None:
         Layout B:  F0002776  3  PRCM30  ...  (line 1)
                    24286651  606.06  MSF  18120  LB  ML11673  (line 2 ← USE THIS)
       Both layouts: line 2 starts with digits (5–9), then decimal/integer, then MSF.
-      The only difference was digit length (6 vs 8) — now covered by \d{5,9}.
+      The only difference was digit length (6 vs 8) — now covered by \\d{5,9}.
     • Single-line BOL:
         N0089112  8  LB2035  35# EnviroLiner ...  (alphanumeric ← USE THIS)
     Always use the LAST (second) BOL value when two exist.
