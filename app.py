@@ -2539,17 +2539,31 @@ with st.sidebar:
     st.metric("Coded Invoices", n_proc)
 
     if n_proc > 0:
-        zip_bytes = _get_processed_zip()
-        st.download_button(
-            "⬇️ Download ZIP (all)",
-            data=zip_bytes,
-            file_name=f"invoices_{date.today().strftime('%Y%m%d')}.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        # Built on demand instead of on every rerun of every page (this
+        # sidebar renders app-wide) — embedding a large ZIP's bytes in
+        # every single screen update is what was stalling the browser on
+        # big batches (see the "Prepare ZIP" button in Coding results).
+        _sidebar_zip_sig = tuple(item["filename"] for item in st.session_state.processed)
+        if st.session_state.get("sidebar_zip_ready_sig") == _sidebar_zip_sig:
+            zip_bytes = _get_processed_zip()
+            st.download_button(
+                f"⬇️ Download ZIP (all) — {len(zip_bytes) / 1_048_576:.1f} MB",
+                data=zip_bytes,
+                file_name=f"invoices_{date.today().strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="sidebar_zip_dl_ready",
+            )
+        else:
+            if st.button("📦 Prepare ZIP (all)", use_container_width=True,
+                         help="Builds the ZIP only when asked, instead of sending it "
+                              "on every screen — avoids the browser stalling."):
+                st.session_state.sidebar_zip_ready_sig = _sidebar_zip_sig
+                st.rerun()
         if st.button("🗑️ Clear all results", use_container_width=True, type="secondary"):
             st.session_state.processed = []
             st.session_state.coding_dl_selected = None
+            st.session_state.sidebar_zip_ready_sig = None
             st.rerun()
 
     st.divider()
@@ -3417,15 +3431,28 @@ if active_module == "coding":
         with col_hdr:
             st.subheader(f"📋 Coded Invoices — {n} file(s)")
         with col_zip:
-            zip_all = _get_processed_zip()
-            st.download_button(
-                f"⬇️ Download ZIP ({n})",
-                data=zip_all,
-                file_name=f"coded_invoices_{date.today().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
+            # Built on demand instead of on every rerun — embedding the full
+            # ZIP's bytes on every screen update (every click anywhere on the
+            # page) is what stalls the browser on large batches.
+            _coding_zip_sig = tuple(item["filename"] for item in st.session_state.processed)
+            if st.session_state.get("coding_zip_ready_sig") == _coding_zip_sig:
+                zip_all = _get_processed_zip()
+                st.download_button(
+                    f"⬇️ Download ZIP ({n}) — {len(zip_all) / 1_048_576:.1f} MB",
+                    data=zip_all,
+                    file_name=f"coded_invoices_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                    key="coding_zip_dl_ready",
+                )
+            else:
+                if st.button("📦 Prepare ZIP", use_container_width=True, type="primary",
+                             help="Builds the ZIP only when you ask for it, instead of "
+                                  "on every screen update — avoids the browser stalling "
+                                  "on large batches."):
+                    st.session_state.coding_zip_ready_sig = _coding_zip_sig
+                    st.rerun()
         with col_del:
             if st.button("🗑️ Delete all", use_container_width=True):
                 st.session_state.processed = []
@@ -3689,15 +3716,43 @@ if active_module == "bourretcoding":
         with col_hdr:
             st.subheader(f"📋 Coded Invoices — {n} file(s)")
         with col_zip:
+            # Built (and cached) on demand instead of on every rerun — embedding
+            # or rebuilding the full ZIP on every screen update is what stalls
+            # the browser on large batches.
+            _bzip_sig = tuple(item["filename"] for item in last_batch)
+            if st.session_state.get("bourretcoding_zip_sig") == _bzip_sig:
+                zip_bytes = st.session_state["bourretcoding_zip_bytes"]
+                st.download_button(
+                    f"⬇️ Download ZIP ({n}) — {len(zip_bytes) / 1_048_576:.1f} MB",
+                    data=zip_bytes,
+                    file_name=f"bourret_coded_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                    key="bourretcoding_zip_dl_ready",
+                )
+            else:
+                if st.button("📦 Prepare ZIP", use_container_width=True, type="primary",
+                             key="bourretcoding_zip_prepare",
+                             help="Builds the ZIP only when you ask for it — avoids "
+                                  "the browser stalling on large batches."):
+                    st.session_state["bourretcoding_zip_bytes"] = make_zip(last_batch)
+                    st.session_state["bourretcoding_zip_sig"]   = _bzip_sig
+                    st.rerun()
+
+        sel = st.session_state.get("bourretcoding_dl_selected")
+        if sel is not None and sel < len(last_batch):
+            item = last_batch[sel]
+            st.success(f"✅ Ready: **{item['filename']}**")
             st.download_button(
-                f"⬇️ Download ZIP ({n})",
-                data=make_zip(last_batch),
-                file_name=f"bourret_coded_{date.today().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
+                f"⬇️ Download {item['filename']}",
+                data=item["pdf_bytes"],
+                file_name=item["filename"],
+                mime="application/pdf",
+                key="bourretcoding_dl_ready",
                 type="primary",
-                use_container_width=True,
-                key="bourretcoding_zip_dl",
             )
+
         st.divider()
         for i, item in enumerate(last_batch):
             col1, col2 = st.columns([5, 1])
@@ -3708,14 +3763,10 @@ if active_module == "bourretcoding":
                     unsafe_allow_html=True,
                 )
             with col2:
-                st.download_button(
-                    "⬇️",
-                    data=item["pdf_bytes"],
-                    file_name=item["filename"],
-                    mime="application/pdf",
-                    key=f"bourretcoding_dl_{i}",
-                    use_container_width=True,
-                )
+                if st.button("📥", key=f"bourretcoding_dl_{i}", use_container_width=True,
+                             help="Prepare this file's download"):
+                    st.session_state.bourretcoding_dl_selected = i
+                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3856,15 +3907,43 @@ if active_module == "prodencoding":
         with col_hdr:
             st.subheader(f"📋 Coded Invoices — {n} file(s)")
         with col_zip:
+            # Built (and cached) on demand instead of on every rerun — embedding
+            # or rebuilding the full ZIP on every screen update is what stalls
+            # the browser on large batches.
+            _pzip_sig = tuple(item["filename"] for item in last_batch)
+            if st.session_state.get("prodencoding_zip_sig") == _pzip_sig:
+                zip_bytes = st.session_state["prodencoding_zip_bytes"]
+                st.download_button(
+                    f"⬇️ Download ZIP ({n}) — {len(zip_bytes) / 1_048_576:.1f} MB",
+                    data=zip_bytes,
+                    file_name=f"proden_coded_{date.today().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                    key="prodencoding_zip_dl_ready",
+                )
+            else:
+                if st.button("📦 Prepare ZIP", use_container_width=True, type="primary",
+                             key="prodencoding_zip_prepare",
+                             help="Builds the ZIP only when you ask for it — avoids "
+                                  "the browser stalling on large batches."):
+                    st.session_state["prodencoding_zip_bytes"] = make_zip(last_batch)
+                    st.session_state["prodencoding_zip_sig"]   = _pzip_sig
+                    st.rerun()
+
+        sel = st.session_state.get("prodencoding_dl_selected")
+        if sel is not None and sel < len(last_batch):
+            item = last_batch[sel]
+            st.success(f"✅ Ready: **{item['filename']}**")
             st.download_button(
-                f"⬇️ Download ZIP ({n})",
-                data=make_zip(last_batch),
-                file_name=f"proden_coded_{date.today().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
+                f"⬇️ Download {item['filename']}",
+                data=item["pdf_bytes"],
+                file_name=item["filename"],
+                mime="application/pdf",
+                key="prodencoding_dl_ready",
                 type="primary",
-                use_container_width=True,
-                key="prodencoding_zip_dl",
             )
+
         st.divider()
         for i, item in enumerate(last_batch):
             col1, col2 = st.columns([5, 1])
@@ -3874,14 +3953,10 @@ if active_module == "prodencoding":
                     unsafe_allow_html=True,
                 )
             with col2:
-                st.download_button(
-                    "⬇️",
-                    data=item["pdf_bytes"],
-                    file_name=item["filename"],
-                    mime="application/pdf",
-                    key=f"prodencoding_dl_{i}",
-                    use_container_width=True,
-                )
+                if st.button("📥", key=f"prodencoding_dl_{i}", use_container_width=True,
+                             help="Prepare this file's download"):
+                    st.session_state.prodencoding_dl_selected = i
+                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
