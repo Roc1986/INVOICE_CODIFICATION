@@ -4644,17 +4644,22 @@ if active_module == "invsummary":
                     prog.progress((fi + 1) / len(summary_files), text=f"Processing {f.name}…")
                     raw = f.read()
                     d = extract_invoice_summary(raw, f.name)
+                    # Written as text with a literal "." decimal point (not a
+                    # native Excel number) so the value pastes into the
+                    # accounting system exactly as shown, regardless of the
+                    # spreadsheet app's regional decimal-separator setting.
+                    _amt = lambda v: f"{v:.2f}" if v is not None else "—"
                     rows.append({
-                        "Invoice No":     d["invoice_no"] or "—",
-                        "Date":           d["date"].strftime("%d/%m/%Y") if d["date"] else "—",
-                        "PO":             d["po"]  or "—",
+                        "Invoice No": d["invoice_no"] or "—",
+                        "Date":       d["date"].strftime("%d/%m/%Y") if d["date"] else "—",
+                        "Net":        _amt(d["net"]),
+                        "GST":        _amt(d["gst"]),
+                        "QST":        _amt(d["qst"]),
+                        "Total":      _amt(d["total"]),
+                        "GL":         d["gl"]  or "—",
+                        "PO":         d["po"]  or "—",
                         "Bill of Lading": d["bol"] or "—",
-                        "GL":             d["gl"]  or "—",
-                        "Net":            d["net"]   if d["net"]   is not None else "—",
-                        "GST":            d["gst"]   if d["gst"]   is not None else "—",
-                        "QST":            d["qst"]   if d["qst"]   is not None else "—",
-                        "Total":          d["total"] if d["total"] is not None else "—",
-                        "Error":          d["error"] or "",
+                        "Error":      d["error"] or "",
                     })
                 prog.progress(1.0, text="✅ Done")
                 st.session_state["invsummary_results"] = rows
