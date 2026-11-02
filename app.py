@@ -1802,8 +1802,8 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     """
     Extract everything the Invoice Summary module needs for manual data
     entry into the accounting system, without opening the PDF: invoice
-    number, date, PO (customer order no.), bill of lading, net amount, GST,
-    QST, and total — GST and QST kept as separate figures (unlike
+    number, date, PO (customer order no.), bill of lading, GL, net amount,
+    GST, QST, and total — GST and QST kept as separate figures (unlike
     extract_invoice_amounts' combined "taxes", which is all AP Audit needs).
 
     Atlantic's own invoices print the Quebec tax line as "Quebec PST" (not
@@ -1812,7 +1812,7 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     known, the same fallback extract_invoice_amounts relies on.
     """
     result = {
-        "invoice_no": None, "date": None, "po": None, "bol": None,
+        "invoice_no": None, "date": None, "po": None, "bol": None, "gl": None,
         "net": None, "gst": None, "qst": None, "total": None,
         "error": None,
     }
@@ -1820,6 +1820,7 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
         inv_data = extract_invoice_data(pdf_bytes, filename)
         result["invoice_no"] = inv_data.get("invoice_no")
         result["po"]         = inv_data.get("customer_order")
+        result["gl"]         = get_gl(inv_data.get("product_code"))
         result["error"]      = inv_data.get("error")
 
         result["date"] = extract_invoice_date(pdf_bytes)
@@ -4648,6 +4649,7 @@ if active_module == "invsummary":
                         "Date":           d["date"].strftime("%d/%m/%Y") if d["date"] else "—",
                         "PO":             d["po"]  or "—",
                         "Bill of Lading": d["bol"] or "—",
+                        "GL":             d["gl"]  or "—",
                         "Net":            d["net"]   if d["net"]   is not None else "—",
                         "GST":            d["gst"]   if d["gst"]   is not None else "—",
                         "QST":            d["qst"]   if d["qst"]   is not None else "—",
@@ -4661,7 +4663,8 @@ if active_module == "invsummary":
                 rows = st.session_state["invsummary_results"]
                 df = pd.DataFrame(rows)
 
-                n_ok   = sum(1 for r in rows if not r["Error"] and r["Invoice No"] != "—")
+                n_ok   = sum(1 for r in rows if not r["Error"] and r["Invoice No"] != "—"
+                             and r["GL"] != "—")
                 n_warn = len(rows) - n_ok
 
                 c1, c2, c3 = st.columns(3)
