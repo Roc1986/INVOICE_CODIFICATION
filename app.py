@@ -1802,9 +1802,10 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     """
     Extract everything the Invoice Summary module needs for manual data
     entry into the accounting system, without opening the PDF: invoice
-    number, date, PO (customer order no.), bill of lading, GL, net amount,
-    GST, QST, and total — GST and QST kept as separate figures (unlike
-    extract_invoice_amounts' combined "taxes", which is all AP Audit needs).
+    number, date, PO (customer order no.), bill of lading, GL, quantity
+    shipped, net amount, GST, QST, and total — GST and QST kept as separate
+    figures (unlike extract_invoice_amounts' combined "taxes", which is all
+    AP Audit needs).
 
     Atlantic's own invoices print the Quebec tax line as "Quebec PST" (not
     "QST"/"TVQ"), so that's matched here too. Any one of net/total/QST
@@ -1813,7 +1814,7 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     """
     result = {
         "invoice_no": None, "date": None, "po": None, "bol": None, "gl": None,
-        "net": None, "gst": None, "qst": None, "total": None,
+        "qty": None, "net": None, "gst": None, "qst": None, "total": None,
         "error": None,
     }
     try:
@@ -1831,6 +1832,24 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
             for page in pdf.pages:
                 full_text += (page.extract_text() or "") + "\n"
         lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+        # Qty shipped: each line-item row has the quantity directly before
+        # its product code (e.g. "3 PL2030 30# Stage 1 Liner ..." or, when
+        # the bill-of-lading number shares the row, "N0091337 11 B2042
+        # ..."). Anchored to KNOWN codes (same list extract_invoice_data
+        # uses) rather than position, since that varies between layouts;
+        # summed across all line items for a multi-line invoice.
+        known_codes = sorted(
+            [str(r["codigo"]).upper() for r in st.session_state.gl_codes],
+            key=len, reverse=True,
+        )
+        if known_codes:
+            qty_re = re.compile(r'\b(\d{1,4})\s+(?:' +
+                                 "|".join(re.escape(c) for c in known_codes) + r')\b')
+            for line in lines:
+                m = qty_re.search(line.upper())
+                if m:
+                    result["qty"] = (result["qty"] or 0) + int(m.group(1))
 
         last_total = None
         for line in lines:
@@ -4659,6 +4678,7 @@ if active_module == "invsummary":
                         "GL":         d["gl"]  or "—",
                         "PO":         d["po"]  or "—",
                         "Bill of Lading": d["bol"] or "—",
+                        "qty shipped": d["qty"] if d["qty"] is not None else "—",
                         "Error":      d["error"] or "",
                     })
                 prog.progress(1.0, text="✅ Done")
