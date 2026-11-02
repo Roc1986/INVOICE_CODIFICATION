@@ -795,7 +795,8 @@ def extract_invoice_data(pdf_bytes: bytes, filename: str = "") -> dict:
 
 
 def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0,
-                  geometry=None, lines_override=None):
+                  geometry=None, lines_override=None, box=True,
+                  text_color=(0.85, 0.0, 0.0)):
     """
     geometry, when given, overrides the globally-configured stamp position/size
     (st.session_state.stamp_*, set in Settings) with an explicit
@@ -807,6 +808,11 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0,
     / CC+GL / DATE layout with an arbitrary list of lines — used by formats
     whose stamp content varies by more than just these four fields, such as
     Proden's GL-dependent AMOUNT/BACKUP line.
+
+    box=False skips the bordered/filled rectangle and draws text_color text
+    directly at `geometry` instead — used for the folio reference, which
+    goes next to the coding stamp as plain text rather than its own box
+    (matching how it used to be handwritten there).
     """
     if geometry:
         sx, sy_top, sw, sh = geometry
@@ -843,11 +849,12 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0,
         c.translate(cx_pdf, cy_pdf)
         c.rotate(rot_angle)
         lx, ly = -sw / 2, -sh / 2
-        c.setStrokeColorRGB(0.85, 0.0, 0.0)
-        c.setFillColorRGB(1.0, 1.0, 1.0)
-        c.setLineWidth(1.8)
-        c.rect(lx, ly, sw, sh, fill=1)
-        c.setFillColorRGB(0.85, 0.0, 0.0)
+        if box:
+            c.setStrokeColorRGB(0.85, 0.0, 0.0)
+            c.setFillColorRGB(1.0, 1.0, 1.0)
+            c.setLineWidth(1.8)
+            c.rect(lx, ly, sw, sh, fill=1)
+        c.setFillColorRGB(*text_color)
         c.setFont("Helvetica-Bold", 8.5)
         line_h = sh / (len(stamp_lines) + 1.2)
         tx, ty = lx + 10, ly + sh - line_h
@@ -856,11 +863,12 @@ def create_stamp(user, vendor, cc, gl, coding_date, page_w, page_h, rotation=0,
         c.restoreState()
     else:
         sy_bot = sy_top - sh
-        c.setStrokeColorRGB(0.85, 0.0, 0.0)
-        c.setFillColorRGB(1.0, 1.0, 1.0)
-        c.setLineWidth(1.8)
-        c.rect(sx, sy_bot, sw, sh, fill=1)
-        c.setFillColorRGB(0.85, 0.0, 0.0)
+        if box:
+            c.setStrokeColorRGB(0.85, 0.0, 0.0)
+            c.setFillColorRGB(1.0, 1.0, 1.0)
+            c.setLineWidth(1.8)
+            c.rect(sx, sy_bot, sw, sh, fill=1)
+        c.setFillColorRGB(*text_color)
         c.setFont("Helvetica-Bold", 8.5)
         line_h = sh / (len(stamp_lines) + 1.2)
         tx, ty = sx + 10, sy_bot + sh - line_h
@@ -915,6 +923,51 @@ def _already_coded(pdf_bytes: bytes) -> bool:
     except Exception:
         return False
     return "POSTED BY:" in text
+
+
+def _coding_geometry_for_kind(kind: str) -> tuple:
+    """The (x, y_top, w, h) box geometry create_stamp used for this
+    invoice's original coding stamp, by supplier — needed to anchor the
+    folio reference text next to it."""
+    if kind == "bourret":
+        return BOURRET_STAMP_GEOMETRY
+    if kind == "proden":
+        return PRODEN_STAMP_GEOMETRY
+    return (st.session_state.stamp_x, st.session_state.stamp_y_top,
+            st.session_state.stamp_w, st.session_state.stamp_h)
+
+
+def _already_has_folio(pdf_bytes: bytes) -> bool:
+    """True if page 1 already carries a 'FOLIO:' reference, so re-running
+    folio assignment doesn't stamp the same invoice twice."""
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ""
+    except Exception:
+        return False
+    return "FOLIO:" in text.upper()
+
+
+def apply_folio_stamp(pdf_bytes: bytes, folio: str, kind: str = "atlantic") -> bytes:
+    """
+    Writes the assigned folio (e.g. "26103011-67" = session + voucher, from
+    the A/P Voucher Audit Listing) as plain black text right next to the
+    existing red coding-stamp box — the same spot it used to be handwritten,
+    now automated by the Invoice Summary & Folio module.
+    """
+    sx, sy_top, sw, sh = _coding_geometry_for_kind(kind)
+    folio_geometry = (sx + sw + 8, sy_top, 150, 20)
+    reader = PdfReader(BytesIO(pdf_bytes))
+    page = reader.pages[0]
+    pw = float(page.mediabox.width)
+    ph = float(page.mediabox.height)
+    rotation = int(page.get("/Rotate", 0) or 0)
+    stamp_bytes = create_stamp(
+        None, None, None, None, None, pw, ph, rotation,
+        geometry=folio_geometry, lines_override=[f"FOLIO: {folio}"],
+        box=False, text_color=(0.0, 0.0, 0.0),
+    )
+    return stamp_pdf(pdf_bytes, stamp_bytes)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1397,7 +1450,7 @@ def extract_invoice_date(pdf_bytes: bytes) -> "date | None":
     return None
 
 
-def parse_audit_report(pdf_bytes: bytes) -> dict:
+def parse_audit_report(pdf_bytes: bytes) -> tuple:
     """
     Parse the A/P Voucher Audit Listing PDF (Crystal Reports format).
 
@@ -1407,8 +1460,13 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
     Invoice date = date on the same line as the APINV/invoice-number row;
     due date = the next date found in the rows below it (yk+6..yk+45).
     Total is located by the 'Total:' label; falls back to max amount in block.
+
+    Returns (records, session_no) — session_no is the report's "(Session:
+    26103011)" header value (a string, e.g. "26103011"), used elsewhere to
+    build a voucher's full folio ("<session>-<voucher>"); None if not found.
     """
     records = {}
+    session_no = None
     known_ccs = {r["cc"].upper() for r in st.session_state.proveedores}
 
     _ISO_PAT    = re.compile(r'^\d{4}-\d{2}-\d{2}$')
@@ -1493,6 +1551,11 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
         all_chars: list = []
         y_offset = 0.0
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if pdf.pages:
+                m_session = re.search(r'Session:\s*(\d+)', pdf.pages[0].extract_text() or "",
+                                       re.IGNORECASE)
+                if m_session:
+                    session_no = m_session.group(1)
             for page in pdf.pages:
                 pw = page.extract_words(
                     x_tolerance=3, y_tolerance=3,
@@ -1510,7 +1573,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
                 y_offset += page.height
 
         if not all_words:
-            return records
+            return records, session_no
 
         # Date column x-range, from the "Invoice Date / Due Date" header
         # (both sub-labels start at the same x0 as the column itself).
@@ -1678,7 +1741,7 @@ def parse_audit_report(pdf_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    return records
+    return records, session_no
 
 
 def extract_invoice_amounts(pdf_bytes: bytes) -> dict:
@@ -1732,6 +1795,76 @@ def extract_invoice_amounts(pdf_bytes: bytes) -> dict:
 
     except Exception:
         pass
+    return result
+
+
+def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
+    """
+    Extract everything the Invoice Summary module needs for manual data
+    entry into the accounting system, without opening the PDF: invoice
+    number, date, PO (customer order no.), bill of lading, net amount, GST,
+    QST, and total — GST and QST kept as separate figures (unlike
+    extract_invoice_amounts' combined "taxes", which is all AP Audit needs).
+
+    Atlantic's own invoices print the Quebec tax line as "Quebec PST" (not
+    "QST"/"TVQ"), so that's matched here too. Any one of net/total/QST
+    missing a direct label match is derived from the other two once GST is
+    known, the same fallback extract_invoice_amounts relies on.
+    """
+    result = {
+        "invoice_no": None, "date": None, "po": None, "bol": None,
+        "net": None, "gst": None, "qst": None, "total": None,
+        "error": None,
+    }
+    try:
+        inv_data = extract_invoice_data(pdf_bytes, filename)
+        result["invoice_no"] = inv_data.get("invoice_no")
+        result["po"]         = inv_data.get("customer_order")
+        result["error"]      = inv_data.get("error")
+
+        result["date"] = extract_invoice_date(pdf_bytes)
+        result["bol"]  = _splitter_extract_bol(inv_data.get("raw_lines") or [])
+
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+        lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+        last_total = None
+        for line in lines:
+            upper = line.upper()
+            amounts = re.findall(r'([\d,]+\.\d{2})', line)
+            if not amounts:
+                continue
+            val = float(amounts[0].replace(",", ""))
+
+            if re.search(r'\bSUB\s*TOTAL\b|\bSOUS.?TOTAL\b', upper):
+                result["net"] = val
+            elif re.search(r'\bGST\b|\bTPS\b|G\.S\.T|T\.P\.S', upper):
+                result["gst"] = (result["gst"] or 0.0) + val
+            elif re.search(r'\bQST\b|\bTVQ\b|Q\.S\.T|T\.V\.Q|\bPST\b', upper):
+                result["qst"] = (result["qst"] or 0.0) + val
+            elif re.search(r'^\s*TOTAL\b', upper):
+                last_total = val
+        if last_total is not None:
+            result["total"] = last_total
+
+        taxes_known = (result["gst"] is not None) and (result["qst"] is not None)
+        if result["total"] is None and result["net"] is not None and taxes_known:
+            result["total"] = round(result["net"] + result["gst"] + result["qst"], 2)
+        elif result["net"] is None and result["total"] is not None and taxes_known:
+            result["net"] = round(result["total"] - result["gst"] - result["qst"], 2)
+        elif (result["qst"] is None and result["gst"] is not None
+              and result["net"] is not None and result["total"] is not None):
+            result["qst"] = round(result["total"] - result["net"] - result["gst"], 2)
+
+        for key in ("net", "gst", "qst", "total"):
+            if result[key] is not None:
+                result[key] = round(result[key], 2)
+
+    except Exception as e:
+        result["error"] = str(e)
     return result
 
 
@@ -2495,6 +2628,7 @@ MODULES = [
     {"key": "bourretcoding", "icon": "🧾", "label": "Bourret Coding", "desc": "Bulk-code Transport Bourret invoices (fixed vendor, choose GL & CC)."},
     {"key": "prodencoding", "icon": "📑", "label": "Proden Coding", "desc": "Bulk-code Les Entreprises Proden invoices (fixed vendor, choose GL)."},
     {"key": "couru",    "icon": "📊", "label": "Couru Code",        "desc": "Extract coding data for Couru entry."},
+    {"key": "invsummary", "icon": "📝", "label": "Invoice Summary & Folio", "desc": "Excel summary for manual entry, then stamp the assigned folio from the audit report."},
     {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
     {"key": "recon",    "icon": "🧮", "label": "Statement Reconciliation", "desc": "Reconcile Atlantic's statement against the system and invoice copies."},
     {"key": "payment",  "icon": "💳", "label": "Payment Packager",  "desc": "Bundle invoices into payment batches."},
@@ -4155,7 +4289,7 @@ if active_module == "audit":
             st.rerun()
 
     if run_audit and audit_inv_files and audit_report_file:
-        audit_data = parse_audit_report(audit_report_file.read())
+        audit_data, _audit_session_no = parse_audit_report(audit_report_file.read())
         st.session_state["audit_data_count"] = len(audit_data)
 
         if not audit_data:
@@ -4456,6 +4590,302 @@ if active_module == "audit":
             file_name=f"ap_audit_validation_{date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — INVOICE SUMMARY & FOLIO
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "invsummary":
+    st.subheader("📝 Invoice Summary & Folio")
+    st.markdown(
+        "Two steps for Atlantic invoices, so you never have to open a PDF to key "
+        "it into the system:\n\n"
+        "1. **Excel Summary** — upload the coded invoices and get an Excel with "
+        "invoice number, date, PO, bill of lading, net, GST, QST and total, ready "
+        "to copy into the system.\n"
+        "2. **Assign Folio** — once those invoices are entered and you've exported "
+        "the **A/P Voucher Audit Listing**, upload the same invoices plus that "
+        "report here. Each invoice is matched by number and its folio "
+        "(`<session>-<voucher>`) is stamped on automatically, next to the coding "
+        "stamp — no more writing it in by hand."
+    )
+
+    tab_summary, tab_folio = st.tabs(["📊 Excel Summary", "🏷️ Assign Folio"])
+
+    # ── Excel Summary ──────────────────────────────────────────────────────
+    with tab_summary:
+        if "invsummary_upload_key" not in st.session_state:
+            st.session_state.invsummary_upload_key = 0
+
+        col_up, col_clear = st.columns([5, 1])
+        with col_up:
+            summary_files = st.file_uploader(
+                "Drag or select one or more Atlantic invoice PDFs",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"invsummary_uploader_{st.session_state.invsummary_upload_key}",
+            )
+        with col_clear:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🗑️ Clear", use_container_width=True, key="invsummary_clear"):
+                st.session_state.invsummary_upload_key += 1
+                st.session_state.pop("invsummary_results", None)
+                st.rerun()
+
+        if not summary_files:
+            st.info("📂 Upload invoice PDFs to get started.")
+        else:
+            st.success(f"✅ **{len(summary_files)} file(s)** loaded")
+            if st.button("📊 Generate Excel Summary", type="primary", key="invsummary_run"):
+                rows = []
+                prog = st.progress(0, text="Extracting…")
+                for fi, f in enumerate(summary_files):
+                    prog.progress((fi + 1) / len(summary_files), text=f"Processing {f.name}…")
+                    raw = f.read()
+                    d = extract_invoice_summary(raw, f.name)
+                    rows.append({
+                        "Invoice No":     d["invoice_no"] or "—",
+                        "Date":           d["date"].strftime("%d/%m/%Y") if d["date"] else "—",
+                        "PO":             d["po"]  or "—",
+                        "Bill of Lading": d["bol"] or "—",
+                        "Net":            d["net"]   if d["net"]   is not None else "—",
+                        "GST":            d["gst"]   if d["gst"]   is not None else "—",
+                        "QST":            d["qst"]   if d["qst"]   is not None else "—",
+                        "Total":          d["total"] if d["total"] is not None else "—",
+                        "Error":          d["error"] or "",
+                    })
+                prog.progress(1.0, text="✅ Done")
+                st.session_state["invsummary_results"] = rows
+
+            if st.session_state.get("invsummary_results"):
+                rows = st.session_state["invsummary_results"]
+                df = pd.DataFrame(rows)
+
+                n_ok   = sum(1 for r in rows if not r["Error"] and r["Invoice No"] != "—")
+                n_warn = len(rows) - n_ok
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown(
+                        f"<div class='stat-box'><div class='stat-num blue'>{len(rows)}</div>"
+                        f"<div class='stat-lbl'>Invoices processed</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                with c2:
+                    st.markdown(
+                        f"<div class='stat-box'><div class='stat-num green'>{n_ok}</div>"
+                        f"<div class='stat-lbl'>Complete</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                with c3:
+                    col_c = "amber" if n_warn else "green"
+                    st.markdown(
+                        f"<div class='stat-box'><div class='stat-num {col_c}'>{n_warn}</div>"
+                        f"<div class='stat-lbl'>Need review</div></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                buf = BytesIO()
+                display_df = df.drop(columns=["Error"]) if all(r == "" for r in df["Error"]) else df
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    display_df.to_excel(writer, index=False, sheet_name="Invoice Summary")
+                buf.seek(0)
+                st.download_button(
+                    f"⬇️ Download Excel ({len(rows)} invoices)",
+                    data=buf.read(),
+                    file_name=f"invoice_summary_{date.today().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key="invsummary_dl",
+                )
+
+    # ── Assign Folio ───────────────────────────────────────────────────────
+    with tab_folio:
+        st.markdown(
+            "Upload the **coded invoices** (any supplier) and the **A/P Voucher "
+            "Audit Listing** they were posted under. Matched invoices get their "
+            "folio stamped automatically; anything not yet in the report is left "
+            "untouched so you can try again once it's posted."
+        )
+        col_inv_up, col_rpt_up = st.columns(2)
+        with col_inv_up:
+            st.markdown("**📄 Coded Invoice PDFs**")
+            folio_inv_files = st.file_uploader(
+                "Upload invoices", type=["pdf"], accept_multiple_files=True,
+                key="folio_inv_upload", label_visibility="collapsed",
+            )
+            if folio_inv_files:
+                st.caption(f"{len(folio_inv_files)} invoice(s) loaded")
+        with col_rpt_up:
+            st.markdown("**📋 A/P Voucher Audit Listing (PDF)**")
+            folio_report_file = st.file_uploader(
+                "Upload audit report", type=["pdf"], accept_multiple_files=False,
+                key="folio_report_upload", label_visibility="collapsed",
+            )
+            if folio_report_file:
+                st.caption(f"Report: **{folio_report_file.name}**")
+
+        col_run_f, col_clr_f, _ = st.columns([2, 2, 5])
+        with col_run_f:
+            run_folio = st.button(
+                "🏷️ Assign Folios", type="primary", use_container_width=True,
+                disabled=not (folio_inv_files and folio_report_file),
+            )
+        with col_clr_f:
+            if st.button("🗑️ Clear results", use_container_width=True, key="folio_clear"):
+                for k in ("folio_results", "folio_unmatched", "folio_skipped",
+                          "folio_dl_selected", "folio_zip_sig", "folio_zip_bytes"):
+                    st.session_state[k] = None
+                st.rerun()
+
+        if run_folio and folio_inv_files and folio_report_file:
+            audit_records, session_no = parse_audit_report(folio_report_file.read())
+            if not session_no:
+                st.error(
+                    "⚠️ Could not find the report's session number (the "
+                    "\"(Session: ...)\" header) — can't build the folio without "
+                    "it. Please verify this is the correct A/P Voucher Audit Listing."
+                )
+            else:
+                stamped, unmatched, skipped = [], [], []
+                prog = st.progress(0, text="Matching invoices…")
+                for fi, f in enumerate(folio_inv_files):
+                    prog.progress((fi + 1) / len(folio_inv_files), text=f"Processing {f.name}…")
+                    raw = f.read()
+                    with pdfplumber.open(BytesIO(raw)) as _pdf:
+                        peek_text = _pdf.pages[0].extract_text() or ""
+                    if len(peek_text.strip()) < 200 and OCR_AVAILABLE:
+                        ocr_text = _ocr_page1_best(raw)
+                        if len(ocr_text.strip()) > len(peek_text.strip()):
+                            peek_text = ocr_text
+                    kind = _detect_invoice_kind(peek_text)
+
+                    if kind == "bourret":
+                        lines = [ln.strip() for ln in peek_text.splitlines() if ln.strip()]
+                        invoice_no, _pod = _bourret_extract_ids(lines)
+                    elif kind == "proden":
+                        fields = _proden_parse_fields_from_text(peek_text)
+                        invoice_no = fields["invoice_no"]
+                    else:
+                        invoice_no = extract_invoice_data(raw, f.name).get("invoice_no")
+
+                    rec = audit_records.get(invoice_no) if invoice_no else None
+                    if rec is None or not rec.get("voucher"):
+                        unmatched.append({"filename": f.name, "invoice_no": invoice_no or "—"})
+                        continue
+                    if _already_has_folio(raw):
+                        skipped.append({"filename": f.name, "invoice_no": invoice_no,
+                                         "reason": "already has a folio stamped"})
+                        continue
+
+                    folio = f"{session_no}-{rec['voucher']}"
+                    try:
+                        new_bytes = apply_folio_stamp(raw, folio, kind=kind)
+                        stamped.append({
+                            "filename": f.name, "pdf_bytes": new_bytes,
+                            "invoice_no": invoice_no, "voucher": rec["voucher"], "folio": folio,
+                        })
+                    except Exception as e:
+                        unmatched.append({"filename": f.name, "invoice_no": invoice_no,
+                                           "error": str(e)})
+                prog.progress(1.0, text="✅ Done")
+                st.session_state["folio_results"]     = stamped
+                st.session_state["folio_unmatched"]   = unmatched
+                st.session_state["folio_skipped"]     = skipped
+                st.session_state["folio_dl_selected"] = None
+                st.session_state["folio_zip_sig"]     = None
+                st.session_state["folio_zip_bytes"]   = None
+
+        folio_results   = st.session_state.get("folio_results")
+        folio_unmatched = st.session_state.get("folio_unmatched")
+        folio_skipped   = st.session_state.get("folio_skipped")
+
+        if folio_results is not None:
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num green'>{len(folio_results)}</div>"
+                    f"<div class='stat-lbl'>Folios assigned</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                col_c = "amber" if folio_unmatched else "green"
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num {col_c}'>{len(folio_unmatched or [])}</div>"
+                    f"<div class='stat-lbl'>Not found in report</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                col_c = "amber" if folio_skipped else "green"
+                st.markdown(
+                    f"<div class='stat-box'><div class='stat-num {col_c}'>{len(folio_skipped or [])}</div>"
+                    f"<div class='stat-lbl'>Already had a folio</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+            if folio_unmatched:
+                with st.expander(f"⚠️ {len(folio_unmatched)} invoice(s) not found in the report"):
+                    for item in folio_unmatched:
+                        extra = f" — {item['error']}" if item.get("error") else ""
+                        st.write(f"📄 {item['filename']}  (Invoice No: {item['invoice_no']}){extra}")
+
+            if folio_skipped:
+                with st.expander(f"⏭️ {len(folio_skipped)} invoice(s) skipped"):
+                    for item in folio_skipped:
+                        st.write(f"📄 {item['filename']} — {item['reason']}")
+
+            if folio_results:
+                st.markdown("<br>", unsafe_allow_html=True)
+                _fzip_sig = tuple(item["filename"] for item in folio_results)
+                if st.session_state.get("folio_zip_sig") == _fzip_sig:
+                    zip_bytes = st.session_state["folio_zip_bytes"]
+                    st.download_button(
+                        f"⬇️ Download ZIP ({len(folio_results)}) — {len(zip_bytes) / 1_048_576:.1f} MB",
+                        data=zip_bytes,
+                        file_name=f"folio_assigned_{date.today().strftime('%Y%m%d')}.zip",
+                        mime="application/zip",
+                        type="primary",
+                        key="folio_zip_dl_ready",
+                    )
+                else:
+                    if st.button("📦 Prepare ZIP", key="folio_zip_prepare", type="primary",
+                                 help="Builds the ZIP only when you ask for it — avoids "
+                                      "the browser stalling on large batches."):
+                        st.session_state["folio_zip_bytes"] = make_zip(folio_results)
+                        st.session_state["folio_zip_sig"]   = _fzip_sig
+                        st.rerun()
+
+                sel = st.session_state.get("folio_dl_selected")
+                if sel is not None and sel < len(folio_results):
+                    item = folio_results[sel]
+                    st.success(f"✅ Ready: **{item['filename']}** — folio `{item['folio']}`")
+                    st.download_button(
+                        f"⬇️ Download {item['filename']}",
+                        data=item["pdf_bytes"],
+                        file_name=item["filename"],
+                        mime="application/pdf",
+                        key="folio_dl_ready",
+                        type="primary",
+                    )
+
+                st.divider()
+                for i, item in enumerate(folio_results):
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        st.markdown(
+                            f"📄 **{item['filename']}**&nbsp;&nbsp;|&nbsp;&nbsp;"
+                            f"Folio: <code>{item['folio']}</code>",
+                            unsafe_allow_html=True,
+                        )
+                    with col2:
+                        if st.button("📥", key=f"folio_dl_{i}", use_container_width=True,
+                                     help="Prepare this file's download"):
+                            st.session_state.folio_dl_selected = i
+                            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
