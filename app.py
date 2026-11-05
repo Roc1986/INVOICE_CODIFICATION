@@ -385,8 +385,13 @@ def _splitter_extract_bol(lines: list) -> str | None:
                    354192  195.331  MSF  4824  LB  ML11465  (line 2 ← USE THIS)
         Layout B:  F0002776  3  PRCM30  ...  (line 1)
                    24286651  606.06  MSF  18120  LB  ML11673  (line 2 ← USE THIS)
-      Both layouts: line 2 starts with digits (5–9), then decimal/integer, then MSF.
-      The only difference was digit length (6 vs 8) — now covered by \\d{5,9}.
+        Layout D:  F0003209  10  EPCM22  ...  (line 1)
+                   5159  2671.652  MSF  59776  LB  ML11952  (line 2 ← USE THIS)
+        Layout E:  F0003255  10  EPCM22  ...  (line 1)
+                   M-16221  2384.045  MSF  53887  LB  ML11952  (line 2 ← USE THIS)
+      All layouts: line 2 starts with the shipment identifier (3–9 digits,
+      optionally prefixed by 1–2 letters and an optional hyphen), then a
+      decimal quantity, then MSF.
     • Single-line BOL:
         N0089112  8  LB2035  35# EnviroLiner ...  (alphanumeric ← USE THIS)
     Always use the LAST (second) BOL value when two exist.
@@ -396,9 +401,12 @@ def _splitter_extract_bol(lines: list) -> str | None:
     # The identifier can be:
     #   • Pure digits   : 354192, 24286651  (layouts A & B)
     #   • Letter+digits : C249328           (layout C — letter-prefixed BOL)
-    # [A-Z]? makes the leading letter optional, covering all three layouts.
+    #   • Short digits  : 5159              (layout D — 3-4 digit shipment no.)
+    #   • Letter-hyphen : M-16221           (layout E — hyphenated shipment no.)
+    # The optional 1-2 letter prefix (with optional hyphen) covers all layouts;
+    # the "<decimal> MSF" that follows keeps the match specific to this line.
     for line in lines:
-        m = re.match(r"^([A-Za-z]{0,2}\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
+        m = re.match(r"^((?:[A-Za-z]{1,2}-?)?\d{3,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
         if m:
             return m.group(1).upper()
 
