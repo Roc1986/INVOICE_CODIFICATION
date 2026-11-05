@@ -1967,8 +1967,8 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     known, the same fallback extract_invoice_amounts relies on.
     """
     result = {
-        "invoice_no": None, "date": None, "po": None, "bol": None, "gl": None,
-        "qty": None, "net": None, "gst": None, "qst": None, "total": None,
+        "invoice_no": None, "vendor": None, "date": None, "po": None, "bol": None,
+        "gl": None, "qty": None, "net": None, "gst": None, "qst": None, "total": None,
         "error": None,
     }
     try:
@@ -1977,6 +1977,21 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
         result["po"]         = inv_data.get("customer_order")
         result["gl"]         = get_gl(inv_data.get("product_code"))
         result["error"]      = inv_data.get("error")
+
+        # Vendor: taken from the coding stamp when the invoice is already
+        # coded (reflects any manual choice made at coding time); otherwise
+        # derived with the same rules Invoice Coding uses — type-6 invoices
+        # go to the fixed exception vendor, the rest are looked up by the
+        # order-number prefix in the vendor table.
+        stamp = _parse_coding_stamp(pdf_bytes)
+        if stamp.get("vendor"):
+            result["vendor"] = stamp["vendor"]
+            if stamp.get("gl"):
+                result["gl"] = stamp["gl"]
+        elif inv_data.get("is_six"):
+            result["vendor"] = VENDOR_EXCEPCION
+        elif inv_data.get("cc_prefix"):
+            result["vendor"], _ = get_vendor_cc(inv_data["cc_prefix"])
 
         result["date"] = extract_invoice_date(pdf_bytes)
         result["bol"]  = _splitter_extract_bol(inv_data.get("raw_lines") or [])
@@ -4776,7 +4791,7 @@ if active_module == "invsummary":
         "Two steps for Atlantic invoices, so you never have to open a PDF to key "
         "it into the system:\n\n"
         "1. **Excel Summary** — upload the coded invoices and get an Excel with "
-        "invoice number, date, PO, bill of lading, net, GST, QST and total, ready "
+        "vendor, invoice number, date, PO, bill of lading, net, GST, QST and total, ready "
         "to copy into the system.\n"
         "2. **Assign Folio** — once those invoices are entered and you've exported "
         "the **A/P Voucher Audit Listing**, upload the same invoices plus that "
@@ -4824,6 +4839,7 @@ if active_module == "invsummary":
                     # spreadsheet app's regional decimal-separator setting.
                     _amt = lambda v: f"{v:.2f}" if v is not None else "—"
                     rows.append({
+                        "Vendor":     d["vendor"] or "—",
                         "Invoice No": d["invoice_no"] or "—",
                         "Date":       d["date"].strftime("%d/%m/%Y") if d["date"] else "—",
                         "Net":        _amt(d["net"]),
@@ -4844,7 +4860,7 @@ if active_module == "invsummary":
                 df = pd.DataFrame(rows)
 
                 n_ok   = sum(1 for r in rows if not r["Error"] and r["Invoice No"] != "—"
-                             and r["GL"] != "—")
+                             and r["GL"] != "—" and r.get("Vendor", "—") != "—")
                 n_warn = len(rows) - n_ok
 
                 c1, c2, c3 = st.columns(3)
