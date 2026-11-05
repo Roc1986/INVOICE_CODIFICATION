@@ -14,6 +14,9 @@ import zipfile
 import re
 import copy
 import json
+import base64
+import os
+import requests
 import shutil
 import subprocess
 import tempfile
@@ -92,6 +95,8 @@ DEFAULT_GL_CODES = [
     {"codigo": "NDCM23", "gl": "300052"}, {"codigo": "WT36",   "gl": "300054"},
     {"codigo": "WT26",   "gl": "300054"}, {"codigo": "WT42",   "gl": "300054"},
     {"codigo": "WT31",   "gl": "300054"},
+    {"codigo": "EPCM26", "gl": "300051"}, {"codigo": "EPCM22", "gl": "300052"},
+    {"codigo": "EPCM27", "gl": "300052"},
 ]
 
 DEFAULT_USERS = ["ROC", "MLE", "PD"]
@@ -125,14 +130,155 @@ PRODEN_GL_OPTIONS = ["300009", "300016"]
 PRODEN_STAMP_GEOMETRY = (80, 285, 220, 90)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT DATABASE (vendors / GL codes / users)
+# ─────────────────────────────────────────────────────────────────────────────
+# The tables edited in the Database / Settings modules are stored in
+# `database.json` in the GitHub repo. Streamlit Cloud's disk is wiped on every
+# restart, so "Save changes" commits the file back to GitHub through the
+# Contents API — that way edits survive restarts and redeploys.
+#
+# Needs these Streamlit secrets (App → Settings → Secrets):
+#     [github]
+#     token  = "github_pat_..."          # fine-grained PAT, Contents: Read & write
+#     repo   = "roc1986/invoice_codification"
+#     branch = "main"                    # optional, default "main"
+#     path   = "database.json"           # optional, default "database.json"
+# Without them the app falls back to the local file (lost on restart).
+DB_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.json")
+DB_KEYS = ("proveedores", "gl_codes", "usuarios")
+
+
+def _gh_cfg() -> dict | None:
+    try:
+        cfg = st.secrets.get("github")
+    except Exception:
+        return None
+    if not cfg or not cfg.get("token") or not cfg.get("repo"):
+        return None
+    return {
+        "token":  cfg["token"],
+        "repo":   cfg["repo"],
+        "branch": cfg.get("branch", "main"),
+        "path":   cfg.get("path", "database.json"),
+    }
+
+
+def _gh_url(cfg: dict) -> str:
+    return f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+
+
+def _gh_headers(cfg: dict) -> dict:
+    return {
+        "Authorization": f"Bearer {cfg['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _default_db() -> dict:
+    return {
+        "proveedores": copy.deepcopy(DEFAULT_PROVEEDORES),
+        "gl_codes":    copy.deepcopy(DEFAULT_GL_CODES),
+        "usuarios":    DEFAULT_USERS.copy(),
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_db_cached() -> dict:
+    """Latest saved DB: GitHub (if configured) → local file → built-in defaults."""
+    db = _default_db()
+    loaded = None
+    cfg = _gh_cfg()
+    if cfg:
+        try:
+            r = requests.get(_gh_url(cfg), headers=_gh_headers(cfg),
+                             params={"ref": cfg["branch"]}, timeout=15)
+            if r.status_code == 200:
+                loaded = json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+        except Exception:
+            loaded = None
+    if loaded is None and os.path.exists(DB_LOCAL_PATH):
+        try:
+            with open(DB_LOCAL_PATH, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except Exception:
+            loaded = None
+    if isinstance(loaded, dict):
+        for k in DB_KEYS:
+            if isinstance(loaded.get(k), list) and loaded[k]:
+                db[k] = loaded[k]
+    return db
+
+
+def load_db() -> dict:
+    return copy.deepcopy(_load_db_cached())
+
+
+def persist_db() -> tuple[bool, str]:
+    """
+    Save the current vendors / GL codes / users tables permanently.
+    Returns (ok, message). Always writes the local file; commits to GitHub
+    when the [github] secrets are configured.
+    """
+    db = {k: st.session_state[k] for k in DB_KEYS}
+    payload = json.dumps(db, indent=2, ensure_ascii=False) + "\n"
+    # Skip if identical to what this session last saved (avoids repeat commits
+    # when an uploader re-triggers the import on every rerun)
+    if st.session_state.get("_db_last_persisted") == payload:
+        return True, "Already saved."
+    try:
+        with open(DB_LOCAL_PATH, "w", encoding="utf-8") as f:
+            f.write(payload)
+    except Exception:
+        pass
+
+    cfg = _gh_cfg()
+    if not cfg:
+        return False, ("GitHub storage is not configured — the change is only kept until "
+                       "the app restarts. Add the [github] secrets to make it permanent.")
+    try:
+        sha = None
+        r = requests.get(_gh_url(cfg), headers=_gh_headers(cfg),
+                         params={"ref": cfg["branch"]}, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code != 404:
+            return False, f"GitHub read failed ({r.status_code}): {r.text[:200]}"
+        body = {
+            "message": "Update database.json from the app",
+            "content": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
+            "branch":  cfg["branch"],
+        }
+        if sha:
+            body["sha"] = sha
+        r = requests.put(_gh_url(cfg), headers=_gh_headers(cfg), json=body, timeout=20)
+        if r.status_code not in (200, 201):
+            return False, f"GitHub save failed ({r.status_code}): {r.text[:200]}"
+    except Exception as e:
+        return False, f"GitHub save failed: {e}"
+    st.session_state["_db_last_persisted"] = payload
+    _load_db_cached.clear()
+    return True, "Saved permanently to GitHub."
+
+
+def report_persist(ok: bool, msg: str):
+    if ok:
+        st.toast(f"☁️ {msg}")
+    else:
+        st.warning(f"⚠️ {msg}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────────────────────────────────────
 def init_state():
+    if any(k not in st.session_state for k in DB_KEYS):
+        _db = load_db()
+        for k in DB_KEYS:
+            if k not in st.session_state:
+                st.session_state[k] = _db[k]
     defaults = {
         "active_module":       None,
-        "proveedores":         copy.deepcopy(DEFAULT_PROVEEDORES),
-        "gl_codes":            copy.deepcopy(DEFAULT_GL_CODES),
-        "usuarios":            DEFAULT_USERS.copy(),
         "processed":           [],
         "stamp_x":             281,
         "stamp_y_top":         594,
@@ -239,8 +385,13 @@ def _splitter_extract_bol(lines: list) -> str | None:
                    354192  195.331  MSF  4824  LB  ML11465  (line 2 ← USE THIS)
         Layout B:  F0002776  3  PRCM30  ...  (line 1)
                    24286651  606.06  MSF  18120  LB  ML11673  (line 2 ← USE THIS)
-      Both layouts: line 2 starts with digits (5–9), then decimal/integer, then MSF.
-      The only difference was digit length (6 vs 8) — now covered by \\d{5,9}.
+        Layout D:  F0003209  10  EPCM22  ...  (line 1)
+                   5159  2671.652  MSF  59776  LB  ML11952  (line 2 ← USE THIS)
+        Layout E:  F0003255  10  EPCM22  ...  (line 1)
+                   M-16221  2384.045  MSF  53887  LB  ML11952  (line 2 ← USE THIS)
+      All layouts: line 2 starts with the shipment identifier (3–9 digits,
+      optionally prefixed by 1–2 letters and an optional hyphen), then a
+      decimal quantity, then MSF.
     • Single-line BOL:
         N0089112  8  LB2035  35# EnviroLiner ...  (alphanumeric ← USE THIS)
     Always use the LAST (second) BOL value when two exist.
@@ -250,9 +401,12 @@ def _splitter_extract_bol(lines: list) -> str | None:
     # The identifier can be:
     #   • Pure digits   : 354192, 24286651  (layouts A & B)
     #   • Letter+digits : C249328           (layout C — letter-prefixed BOL)
-    # [A-Z]? makes the leading letter optional, covering all three layouts.
+    #   • Short digits  : 5159              (layout D — 3-4 digit shipment no.)
+    #   • Letter-hyphen : M-16221           (layout E — hyphenated shipment no.)
+    # The optional 1-2 letter prefix (with optional hyphen) covers all layouts;
+    # the "<decimal> MSF" that follows keeps the match specific to this line.
     for line in lines:
-        m = re.match(r"^([A-Za-z]{0,2}\d{5,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
+        m = re.match(r"^((?:[A-Za-z]{1,2}-?)?\d{3,9})\s+[\d,]+\.[\d]+\s+MSF\b", line.strip(), re.IGNORECASE)
         if m:
             return m.group(1).upper()
 
@@ -2742,6 +2896,7 @@ with st.sidebar:
                 if "proveedores"    in db: st.session_state.proveedores    = db["proveedores"]
                 if "gl_codes"       in db: st.session_state.gl_codes       = db["gl_codes"]
                 if "usuarios"       in db: st.session_state.usuarios       = db["usuarios"]
+                report_persist(*persist_db())
                 st.success("✅ Database loaded")
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -5453,8 +5608,11 @@ if active_module == "database":
                         "cc":      str(r.get("cc", "")).strip(),
                     })
             st.session_state.proveedores = new_prov
+            ok, msg = persist_db()
+            report_persist(ok, msg)
             st.success(f"✅ Vendor table updated — {len(new_prov)} vendors saved")
-            st.rerun()
+            if ok:
+                st.rerun()
 
     with db_t2:
         st.subheader("GL Codes Table")
@@ -5481,8 +5639,11 @@ if active_module == "database":
                         "gl":     str(gl).strip() if gl and str(gl).strip().upper() != "NAN" else "",
                     })
             st.session_state.gl_codes = new_gl
+            ok, msg = persist_db()
+            report_persist(ok, msg)
             st.success(f"✅ GL table updated — {len(new_gl)} codes saved")
-            st.rerun()
+            if ok:
+                st.rerun()
 
         st.divider()
         st.subheader("📥 Import from Excel (maestro_contable.xlsx)")
@@ -5526,10 +5687,13 @@ if active_module == "database":
                         "**'proveedores'** and/or **'cuentas_gl'** with data starting on row 2."
                     )
                 else:
+                    ok, msg = persist_db()
+                    report_persist(ok, msg)
                     st.success(
                         f"✅ Imported: {imported_vendors} vendors, {imported_gl} GL codes"
                     )
-                    st.rerun()
+                    if ok:
+                        st.rerun()
             except Exception as e:
                 st.error(f"Error importing Excel: {e}")
 
@@ -5552,6 +5716,7 @@ if active_module == "settings":
             new_users = [u.strip() for u in users_txt.splitlines() if u.strip()]
             if new_users:
                 st.session_state.usuarios = new_users
+                report_persist(*persist_db())
                 st.success(f"✅ {len(new_users)} user(s) saved")
             else:
                 st.warning("The list cannot be empty")
