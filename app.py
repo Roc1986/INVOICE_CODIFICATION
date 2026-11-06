@@ -2820,6 +2820,7 @@ MODULES = [
     {"key": "invsummary", "icon": "📝", "label": "Invoice Summary & Folio", "desc": "Excel summary for manual entry, then stamp the assigned folio from the audit report."},
     {"key": "audit",    "icon": "🔍", "label": "AP Audit",          "desc": "Validate the A/P voucher audit listing."},
     {"key": "recon",    "icon": "🧮", "label": "Statement Reconciliation", "desc": "Reconcile Atlantic's statement against the system and invoice copies."},
+    {"key": "monthend", "icon": "📒", "label": "Month-end 112-000", "desc": "Fill the 112-000 summary, build the Couru list and flag differences from the monthly classeur."},
     {"key": "payment",  "icon": "💳", "label": "Payment Packager",  "desc": "Bundle invoices into payment batches."},
     {"key": "database", "icon": "🗄️",  "label": "Database",          "desc": "Manage vendors, GL codes & users."},
     {"key": "settings", "icon": "⚙️",  "label": "Settings",          "desc": "Configure the coding stamp position."},
@@ -5235,6 +5236,104 @@ if active_module == "recon":
         )
     elif not (recon_statement_files or recon_system_file):
         st.info("📂 Upload the statement and the system extract to run the reconciliation.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTH-END 112-000 REVIEW
+# ══════════════════════════════════════════════════════════════════════════════
+if active_module == "monthend":
+    from month_end_review import run_review, read_lists
+
+    st.subheader("📒 Month-end 112-000 Review")
+    st.markdown(
+        "Upload the month's **classeur** (112-000, O-S CHQS, AP INVOICE, the 0101… system sheets and the "
+        "statements 635108 / 218005 / NT0039 / holding). The tool fills the 112-000 summary with formulas and "
+        "adds the sheets **Couru**, **Ajustes proveedor**, **Correcciones factura** and **Observaciones**."
+    )
+    if "me_upload_key" not in st.session_state:
+        st.session_state.me_upload_key = 0
+    col_up, col_clear = st.columns([5, 1])
+    with col_up:
+        me_file = st.file_uploader("1️⃣ Monthly classeur (.xlsx)", type=["xlsx"],
+                                   key=f"me_uploader_{st.session_state.me_upload_key}")
+    with col_clear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Clear", use_container_width=True, key="me_clear"):
+            st.session_state.me_upload_key += 1
+            for k in ("me_result", "me_lists", "me_src_name"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    if not me_file:
+        st.info("📂 Upload the classeur to get started. Tip: start next month from last month's reviewed file, "
+                "so the adjustment and correction lists carry over.")
+    else:
+        src_bytes = me_file.getvalue()
+        if st.session_state.get("me_src_name") != me_file.name:
+            st.session_state.me_src_name = me_file.name
+            st.session_state.me_lists = read_lists(src_bytes)
+            st.session_state.pop("me_result", None)
+        adj0, fix0 = st.session_state.me_lists
+
+        st.markdown("**2️⃣ Lists to apply** (loaded from the file if it already has them — add or edit rows here)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Supplier adjustments — statement lines that are not invoices (excluded from the Couru)")
+            adj_df = st.data_editor(
+                pd.DataFrame(adj0 or [], columns=["Statement", "Number", "Description"]),
+                num_rows="dynamic", use_container_width=True, key="me_adj",
+                column_config={"Statement": st.column_config.SelectboxColumn(
+                    options=["635108", "218005", "NT0039", "holding"], required=True)},
+            )
+        with c2:
+            st.caption("Invoice-number corrections — booked in the system with a wrong number")
+            fix_df = st.data_editor(
+                pd.DataFrame(fix0 or [], columns=["Number in system", "Correct number", "Description"]),
+                num_rows="dynamic", use_container_width=True, key="me_fix",
+            )
+
+        if st.button("📒 Run month-end review", type="primary", key="me_run"):
+            clean = lambda df: [tuple("" if pd.isna(v) else str(v).strip() for v in row)
+                                for row in df.itertuples(index=False)]
+            with st.spinner("Comparing statements, system and payments…"):
+                try:
+                    st.session_state.me_result = run_review(src_bytes, clean(adj_df), clean(fix_df))
+                except Exception as e:
+                    st.session_state.pop("me_result", None)
+                    st.error(f"Could not process the classeur: {e}")
+
+        if st.session_state.get("me_result"):
+            out_bytes, info = st.session_state.me_result
+            st.divider()
+            st.markdown("**3️⃣ Result**")
+            cols = st.columns(len(info["couru"]))
+            for col, c in zip(cols, info["couru"]):
+                col.metric(f"Couru {c['statement']} · {c['invoices']} invoices", f"{c['gross']:,.2f} $")
+            st.caption("Couru amounts include taxes and every listed invoice; the final D24:E27 values follow the "
+                       "'Incluir' and 'Factor tax' columns of the Couru sheet.")
+
+            st.markdown("**Statement breakdown**")
+            st.dataframe(pd.DataFrame(info["cuadre"]).fillna(0), use_container_width=True, hide_index=True)
+
+            st.markdown("**Outstanding payments (O-S CHQS) found in AP INVOICE**")
+            st.dataframe(pd.DataFrame([{
+                "Vendor": p["vend"], "O-S CHQS": p["amt"], "Payment no.": p["pay"] or "NOT FOUND",
+                "Invoices": p["n"], "Invoice total": round(p["invsum"], 2),
+                "Difference": round(p["amt"] - p["invsum"], 2)} for p in info["payments"]]),
+                use_container_width=True, hide_index=True)
+
+            st.markdown("**Points to review**")
+            for p in info["points"]:
+                st.markdown(f"- {p}")
+
+            base = me_file.name.rsplit(".", 1)[0]
+            st.download_button(
+                "⬇️ Download reviewed classeur",
+                data=out_bytes,
+                file_name=f"{base}_revisado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True, key="me_dl",
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
