@@ -1037,12 +1037,10 @@ def stamp_pdf(original_bytes, stamp_bytes):
     reader = PdfReader(BytesIO(original_bytes))
     stamp_reader = PdfReader(BytesIO(stamp_bytes))
     stamp_page = stamp_reader.pages[0]
-    writer = PdfWriter()
-    first = reader.pages[0]
-    first.merge_page(stamp_page)
-    writer.add_page(first)
-    for page in reader.pages[1:]:
-        writer.add_page(page)
+    # Pages must belong to the writer before they're modified: pypdf 7
+    # refuses merge_page() on a page still owned by the reader.
+    writer = PdfWriter(clone_from=reader)
+    writer.pages[0].merge_page(stamp_page)
     out = BytesIO()
     writer.write(out)
     out.seek(0)
