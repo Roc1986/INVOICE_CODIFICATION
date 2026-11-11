@@ -1966,7 +1966,7 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
     """
     result = {
         "invoice_no": None, "vendor": None, "date": None, "po": None, "bol": None,
-        "gl": None, "qty": None, "net": None, "gst": None, "qst": None, "total": None,
+        "gl": None, "qty": None, "unit_price": None, "net": None, "gst": None, "qst": None, "total": None,
         "error": None,
     }
     try:
@@ -2017,6 +2017,20 @@ def extract_invoice_summary(pdf_bytes: bytes, filename: str = "") -> dict:
                 m = qty_re.search(line.upper())
                 if m:
                     result["qty"] = (result["qty"] or 0) + int(m.group(1))
+                    # Unit price: on the same line-item row, the number right
+                    # before the unit (MSF, LB…) that is itself followed by
+                    # the row's total amount, e.g. "... 87 IN 86.53 MSF
+                    # 19,689.21 984.46" -> 86.53. The second BOL line
+                    # ("227.542 MSF 11649 LB") never matches since its
+                    # number after the unit has no 2-decimal amount.
+                    pm = re.search(r'([\d,]*\d\.\d{1,4})\s+[A-Z]{1,4}\s+[\d,]+\.\d{2}\b',
+                                   line[m.end():].upper())
+                    if pm:
+                        price = pm.group(1).replace(",", "")
+                        prices = result["unit_price"] or []
+                        if price not in prices:
+                            prices.append(price)
+                        result["unit_price"] = prices
 
         last_total = None
         for line in lines:
@@ -4790,7 +4804,7 @@ if active_module == "invsummary":
         "Two steps for Atlantic invoices, so you never have to open a PDF to key "
         "it into the system:\n\n"
         "1. **Excel Summary** — upload the coded invoices and get an Excel with "
-        "vendor, invoice number, date, PO, bill of lading, net, GST, QST and total, ready "
+        "vendor, invoice number, date, PO, bill of lading, unit price, net, GST, QST and total, ready "
         "to copy into the system.\n"
         "2. **Assign Folio** — once those invoices are entered and you've exported "
         "the **A/P Voucher Audit Listing**, upload the same invoices plus that "
@@ -4849,6 +4863,10 @@ if active_module == "invsummary":
                         "PO":         d["po"]  or "—",
                         "Bill of Lading": d["bol"] or "—",
                         "qty shipped": d["qty"] if d["qty"] is not None else "—",
+                        # Text, like the amounts, so "." stays the decimal
+                        # point; several distinct prices (multi-line
+                        # invoices) are joined with " / ".
+                        "Unit Price": " / ".join(d["unit_price"]) if d["unit_price"] else "—",
                         "Error":      d["error"] or "",
                     })
                 prog.progress(1.0, text="✅ Done")
