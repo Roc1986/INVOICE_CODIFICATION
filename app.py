@@ -1330,6 +1330,26 @@ def merge_two_pdfs(bytes1: bytes, bytes2: bytes) -> bytes:
         return out.read()
 
 
+def _po_aliases(po_file_key: str) -> list:
+    """
+    Every identifier a PO/backup filename answers to. The full name always
+    counts; names with "_" also answer to each part on its own:
+      '5249_M-16300' -> ['5249_M-16300', '5249', 'M-16300']
+    """
+    key = po_file_key.strip().upper()
+    aliases = [key]
+    for part in key.split("_"):
+        part = part.strip()
+        if part and part not in aliases:
+            aliases.append(part)
+    return aliases
+
+
+def _po_norm(key: str) -> str:
+    """Loose form for comparison: drop spaces/hyphens so 'M-16300' == 'M16300'."""
+    return re.sub(r"[\s\-]", "", key.upper())
+
+
 def run_matching(invoice_files: list, po_files: list,
                  progress_callback=None) -> dict:
     """
@@ -1343,10 +1363,25 @@ def run_matching(invoice_files: list, po_files: list,
     second time (on top of what Streamlit already buffers per upload) even
     for POs that end up unused.
     """
-    po_lookup = {}
+    # A PO/backup file can carry several shipment identifiers in its name,
+    # joined by "_" — e.g. "5249_M-16300.pdf" is the backup for seal no. 5249
+    # AND trailer/BOL no. M-16300. The vendor decides which one prints on the
+    # invoice, so every alias is registered and points at the same file.
+    po_lookup = {}       # alias key -> (file key, file)
+    po_files_by_key = {} # file key  -> file
     for f in po_files:
-        key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
-        po_lookup[key] = f
+        file_key = re.sub(r'\.pdf$', '', f.name, flags=re.IGNORECASE).strip().upper()
+        po_files_by_key[file_key] = f
+    # Registration order = priority on collisions: full filenames first,
+    # then "_" aliases, then the loose (no hyphen/space) forms.
+    for file_key, f in po_files_by_key.items():
+        po_lookup.setdefault(file_key, (file_key, f))
+    for file_key, f in po_files_by_key.items():
+        for alias in _po_aliases(file_key)[1:]:
+            po_lookup.setdefault(alias, (file_key, f))
+    for file_key, f in po_files_by_key.items():
+        for alias in _po_aliases(file_key):
+            po_lookup.setdefault(_po_norm(alias), (file_key, f))
 
     used_po_keys = set()
     matched = []
@@ -1374,16 +1409,18 @@ def run_matching(invoice_files: list, po_files: list,
                 continue
 
             po_key = po_id.upper()
-            if po_key in po_lookup:
-                po_bytes = po_lookup[po_key].getvalue()
-                used_po_keys.add(po_key)
+            hit = po_lookup.get(po_key) or po_lookup.get(_po_norm(po_key))
+            if hit:
+                file_key, po_file = hit
+                po_bytes = po_file.getvalue()
+                used_po_keys.add(file_key)
                 flat_inv = flatten_pdf(inv_bytes)
                 flat_po  = flatten_pdf(po_bytes)
                 merged   = merge_two_pdfs(flat_inv, flat_po)
                 zf.writestr(f"matched/{fname}", merged)
                 matched.append({
                     "invoice_name": fname,
-                    "po_name":      f"{po_id}.pdf",
+                    "po_name":      po_file.name,
                     "po_id":        po_id,
                 })
             else:
@@ -1395,8 +1432,8 @@ def run_matching(invoice_files: list, po_files: list,
                 })
 
     unmatched_po = [
-        name for name in po_lookup
-        if name not in used_po_keys
+        key for key in po_files_by_key
+        if key not in used_po_keys
     ]
 
     zip_buf.seek(0)
@@ -3386,7 +3423,9 @@ if active_module == "matcher":
 
     st.info(
         "📋 **Expected invoice filename format:** `{Invoice No} {Cost Centre} {PO Number}.pdf`  \n"
-        "Example: `82196530 ML V0020978.pdf`  →  will search for PO file `V0020978.pdf`"
+        "Example: `82196530 ML V0020978.pdf`  →  will search for PO file `V0020978.pdf`  \n"
+        "🔗 **One backup, several numbers:** name the PO file with the numbers joined by `_` — "
+        "`5249_M-16300.pdf` matches invoices ending in `5249` **or** `M-16300` (hyphen optional)."
     )
 
     col_inv, col_po = st.columns(2)
