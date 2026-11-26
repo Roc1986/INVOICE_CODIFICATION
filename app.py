@@ -96,7 +96,7 @@ DEFAULT_GL_CODES = [
     {"codigo": "WT26",   "gl": "300054"}, {"codigo": "WT42",   "gl": "300054"},
     {"codigo": "WT31",   "gl": "300054"},
     {"codigo": "EPCM26", "gl": "300051"}, {"codigo": "EPCM22", "gl": "300052"},
-    {"codigo": "EPCM27", "gl": "300052"},
+    {"codigo": "EPCM27", "gl": "300052"}, {"codigo": "HP2030", "gl": "300051"},
 ]
 
 DEFAULT_USERS = ["ROC", "MLE", "PD"]
